@@ -1,0 +1,12 @@
+[
+  {
+    "tenant_id": "tenant-123",
+    "event_type": "usage",
+    "timestamp": "2025-10-08T12:00:00Z"
+  },
+  {
+    "tenant_id": "tenant-456",
+    "event_type": "billing",
+    "timestamp": "2025-10-08T12:05:00Z"
+  }
+]
