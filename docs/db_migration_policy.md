@@ -14,8 +14,8 @@
 - Rollbacks must be defined in a paired `rollback.sql` file
 - Rollbacks must be tested in CI before merging
 
-## CI Gates
-- CI must validate:
-  - Migration file syntax
+## CI Gates  
+- CI must validate: 
+  - Migration file syntax 
   - No destructive changes without rollback
   - Version bump is present

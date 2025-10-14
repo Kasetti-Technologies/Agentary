@@ -8,7 +8,7 @@ paths:
       summary: Ingest usage event
       requestBody:
         required: true
-        content:
+        content: 
           application/json:
             schema:
               $ref: '../usagepilot.v1.json'

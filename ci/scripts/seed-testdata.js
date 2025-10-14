@@ -14,7 +14,7 @@ const client = new Client({
   password: 'devpass',
   database: 'agentary',
 });
-
+ 
 async function seed() {
   try {
     await client.connect();

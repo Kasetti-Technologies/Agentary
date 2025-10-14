@@ -15,7 +15,7 @@ paths:
       responses:
         '200':
           description: OK
-components:
+components: 
   schemas:
     UsageEvent:
       type: object

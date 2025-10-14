@@ -11,5 +11,5 @@ app.get('/vault/fetch', (req, res) => {
     res.status(404).json({ error: 'Secret not found' });
   }
 });
-
+ 
 app.listen(8200, () => console.log('🔐 Fake Vault running on port 8200'));

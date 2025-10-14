@@ -11,7 +11,7 @@ const output = data.map((event) => {
   const canonical = JSON.stringify(event);
   const hash = crypto.createHash('sha256').update(canonical).digest('hex');
   return { ...event, sha256: hash };
-});
+}); 
 
 fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
 console.log(`✅ Golden hashes written to ${outputPath}`);

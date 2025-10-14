@@ -48,8 +48,8 @@ This repo contains canonical schemas, CI workflows, SDK stubs, and runbooks for 
 ---
 
 ## 🧪 How to Run Locally
-
-```bash
+ 
+```bash  
 npm ci
 node ci/scripts/run-ajv-tests.js
 node ci/scripts/compute-golden.js
