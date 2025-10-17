@@ -1,0 +1,32 @@
+name: Contract and Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - "**/*.js"
+      - "schemas/**"
+      - "packages/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Run AJV tests
+        run: node ci/scripts/run-ajv-tests.js
+
+      - name: Verify golden hash parity
+        run: node ci/scripts/verify-golden.js

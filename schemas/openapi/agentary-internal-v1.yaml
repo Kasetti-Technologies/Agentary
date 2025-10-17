@@ -1,0 +1,24 @@
+openapi: 3.0.3
+info:
+  title: Agentary Internal API
+  version: v1
+paths:
+  /usage:
+    post:
+      summary: Ingest usage event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '../usagepilot.v1.json'
+      responses:
+        '200':
+          description: Success
+components:
+  headers:
+    TenantContext:
+      description: Tenant context header
+      required: true
+      schema:
+        type: string

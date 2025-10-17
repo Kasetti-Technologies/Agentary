@@ -1,0 +1,15 @@
+{
+  "tenant_id": {
+    "type": "string",
+    "description": "Unique tenant identifier"
+  },
+  "event_type": {
+    "type": "string",
+    "description": "Type of usage event"
+  },
+  "timestamp": {
+    "type": "string",
+    "format": "date-time",
+    "description": "Event timestamp"
+  }
+}
