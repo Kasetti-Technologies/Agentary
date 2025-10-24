@@ -1,34 +1,29 @@
 {
   "name": "agentary",
   "version": "1.0.0",
-  "description": "- `/api`, `/services`, `/web`: Application code\r - `/schemas`: OpenAPI, JSON Schema, DDL\r - `/ci`: Test data and golden hashes\r - `/docs`: Developer guides and policies\r - `/infra`: Local dev setup (Docker/K3s)\r - `/runbooks`: Incident response guides\r - `/packages`: SDKs and shared libraries",
+  "description": "Agentary Express service with middleware, Docker setup, and testing via Jest + Supertest.",
   "main": "index.js",
+  "type": "commonjs",
   "directories": {
     "doc": "docs"
   },
-  "devDependencies": {
-    "@redocly/cli": "^2.5.0",
-    "@types/express": "^5.0.3",
-    "@types/jest": "^30.0.0",
-    "@types/node": "^24.7.2",
-    "@types/supertest": "^6.0.3",
-    "install": "^0.13.0",
-    "jest": "^30.2.0",
-    "jose": "^6.1.0",
-    "npm": "^11.6.2",
-    "supertest": "^7.1.4",
-    "ts-jest": "^29.4.5",
-    "typescript": "^5.9.3"
-  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "jest --detectOpenHandles",
+    "test:watch": "jest --watch",
     "seed": "node ci/scripts/seed-testdata.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kasetti-Technologies/Agentary.git"
   },
-  "keywords": [],
+  "keywords": [
+    "express",
+    "typescript",
+    "jest",
+    "supertest",
+    "middleware",
+    "jwks"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
@@ -36,9 +31,33 @@
   },
   "homepage": "https://github.com/Kasetti-Technologies/Agentary#readme",
   "dependencies": {
+    "axios": "^1.12.2",
     "express": "^5.1.0",
     "fs": "^0.0.1-security",
+    "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^3.2.0",
+    "kafkajs": "^2.2.4",
     "path": "^0.12.7",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@redocly/cli": "^2.5.0",
+    "@types/axios": "^0.9.36",
+    "@types/axios-mock-adapter": "^1.9.0",
+    "@types/express": "^5.0.3",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^24.7.2",
+    "@types/on-finished": "^2.3.5",
+    "@types/pg": "^8.15.5",
+    "@types/supertest": "^6.0.3",
+    "axios-mock-adapter": "^2.1.0",
+    "install": "^0.13.0",
+    "jest": "^30.2.0",
+    "jose": "^6.1.0",
+    "nock": "^14.0.10",
+    "supertest": "^7.1.4",
+    "ts-jest": "^29.4.5",
+    "typescript": "^5.9.3"
   }
 }

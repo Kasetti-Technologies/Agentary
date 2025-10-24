@@ -1,0 +1,10 @@
+// tsconfig.json
+{
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2022",
+    "esModuleInterop": true,          // lets `import { v4 as uuidv4 } from 'uuid'` work @45
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true
+  }
+}
