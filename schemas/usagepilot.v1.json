@@ -1,11 +1,155 @@
 {
+  "$id": "https://kasetti.ai/schemas/usagepilot.v1.json",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Usage Event",
+  "title": "usagepilot.v1",
   "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "tenant_id",
+    "event_type",
+    "metric",
+    "quantity",
+    "timestamp",
+    "properties"
+  ],
   "properties": {
-    "tenant_id": { "type": "string" },
-    "event_type": { "type": "string" },
-    "timestamp": { "type": "string", "format": "date-time" }
+    "schema_version": {
+      "type": "string",
+      "const": "usagepilot.v1"
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique event id (maps to event_id)"
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Canonical tenant identifier (alias: 'customer_id')."
+    },
+    "customer_id": {
+      "type": "string",
+      "description": "Alias for forward compatibility with external billing (mirrors tenant_id)."
+    },
+    "event_type": {
+      "type": "string",
+      "description": "Discriminator for event subschemas: udf_call | email_reply | doc_summary | ..."
+    },
+    "metric": {
+      "type": "string",
+      "description": "Metric name for billing (e.g., nlp.udf_call, agentic_ai.email_reply)"
+    },
+    "quantity": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Metered value for this event (e.g., 1 or words processed)"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC event time"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "Idempotency key for deduplication"
+    },
+    "event_hash": {
+      "type": "string",
+      "description": "SHA256 hex of canonical event fields"
+    },
+    "estimated_cost_usd": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Producer-side cost estimate for advisory purposes (final cost is computed by billing engine)"
+    },
+    "primary_region": {
+      "type": "string",
+      "description": "Tenant's primary region"
+    },
+    "region_tag": {
+      "type": "string",
+      "description": "Event source region, for residency/audit"
+    },
+    "properties": {
+      "type": "object",
+      "description": "Event-type-specific payload (enforced by discriminator below)"
+    }
   },
-  "required": ["tenant_id", "event_type", "timestamp"]
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "event_type": { "const": "udf_call" },
+        "properties": { "$ref": "#/definitions/udf_call_properties" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "email_reply" },
+        "properties": { "$ref": "#/definitions/email_reply_properties" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "doc_summary" },
+        "properties": { "$ref": "#/definitions/doc_summary_properties" }
+      }
+    }
+  ],
+  "definitions": {
+    "udf_call_properties": {
+      "type": "object",
+      "required": ["udf_name", "query_id", "model_version", "execution_time_ms", "estimated_cost_usd"],
+      "properties": {
+        "udf_name": { "type": "string" },
+        "query_id": { "type": "string" },
+        "model_version": { "type": "string" },
+        "execution_time_ms": { "type": "number", "minimum": 0 },
+        "data_processed_mb": { "type": "number", "minimum": 0 },
+        "snowflake_warehouse": { "type": "string" },
+        "estimated_cost_usd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "email_reply_properties": {
+      "type": "object",
+      "required": [
+        "email_id",
+        "reply_generated",
+        "confidence_score",
+        "processing_time_ms",
+        "model_version",
+        "estimated_cost_usd"
+      ],
+      "properties": {
+        "email_id": { "type": "string" },
+        "reply_generated": { "type": "boolean" },
+        "confidence_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "processing_time_ms": { "type": "number", "minimum": 0 },
+        "human_review_required": { "type": "boolean" },
+        "model_version": { "type": "string" },
+        "estimated_cost_usd": { "type": "number", "minimum": 0 },
+        "intent": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "doc_summary_properties": {
+      "type": "object",
+      "required": [
+        "document_id",
+        "word_count",
+        "summary_length_words",
+        "model_version",
+        "estimated_cost_usd"
+      ],
+      "properties": {
+        "document_id": { "type": "string" },
+        "word_count": { "type": "integer", "minimum": 0 },
+        "summary_length_words": { "type": "integer", "minimum": 0 },
+        "model_version": { "type": "string" },
+        "estimated_cost_usd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  }
 }

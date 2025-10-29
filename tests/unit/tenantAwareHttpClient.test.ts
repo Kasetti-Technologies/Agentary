@@ -49,7 +49,7 @@ describe("tenantAwareHttpClient", () => {
         // Create a claims object where correlation_id is explicitly undefined
         const claimsWithoutCorrelation: TenantClaims = {
             ...mockTenantClaims,
-            correlation_id: undefined, 
+            correlation_id: "", 
         };
 
         // Use a function that returns the modified claims
