@@ -31,6 +31,7 @@
   },
   "homepage": "https://github.com/Kasetti-Technologies/Agentary#readme",
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.922.0",
     "axios": "^1.12.2",
     "express": "^5.1.0",
     "fs": "^0.0.1-security",
