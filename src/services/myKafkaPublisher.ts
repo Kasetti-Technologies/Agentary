@@ -1,20 +1,57 @@
 // src/services/myKafkaPublisher.ts
+import type { Request } from 'express';
+import type { Message } from 'kafkajs';
+import type { TenantClaims } from '../middleware/tenantContext.middleware';
+
 import { withTenantHeaders } from '../utils/tenantAwareKafkaProducer';
 import { Kafka } from 'kafkajs';
 
-export async function emitKafkaMessage(req) {
+/**
+ * Publishes a simple test event to Kafka, automatically injecting the
+ * X‑Tenant‑Context and X‑Correlation‑Id headers that were attached to the
+ * request by `tenantContextMiddleware`.
+ *
+ * @param req – the incoming Express request (populated by the middleware)
+ */
+export async function emitKafkaMessage(req: Request): Promise<void> {
+  // -----------------------------------------------------------------
+  // Build the Kafka client – the broker list is hard‑coded for local dev.
+  // -----------------------------------------------------------------
   const kafka = new Kafka({ brokers: ['localhost:9092'] });
   const producer = kafka.producer();
 
-  const claims = req.tenantContext; // Populated by your middleware
+  // -----------------------------------------------------------------
+  // Grab the tenant claims that the middleware attached.
+  // -----------------------------------------------------------------
+  // `tenantContext` is added at runtime, so we cast the request to `any`
+  // before accessing it and then type‑assert the shape.
+  const claims = (req as any).tenantContext as TenantClaims | undefined;
+
+  // If for some reason the middleware didn’t run, fail fast.
+  if (!claims) {
+    throw new Error('Tenant context not available on request');
+  }
+
+  // -----------------------------------------------------------------
+  // Prepare the payload and run it through the header‑injector.
+  // -----------------------------------------------------------------
   const payload = { event: 'something_happened' };
 
-  const message = withTenantHeaders(claims)({
-    value: Buffer.from(JSON.stringify(payload))
+  // `withTenantHeaders` returns a function that expects a `Message`
+  // and returns a `Message`.  We pass the minimal message (just a value)
+  // and let the wrapper add the required headers.
+  const message = (withTenantHeaders(claims) as (msg: Message) => Message)({
+    value: Buffer.from(JSON.stringify(payload)),
   });
 
+  // -----------------------------------------------------------------
+  // Send the message.  In a real service you would call `producer.connect()`
+  // once at startup; for a small utility it’s fine to connect on‑demand.
+  // -----------------------------------------------------------------
+  await producer.connect();
   await producer.send({
     topic: 'your.topic',
-    messages: [message]
+    messages: [message],
   });
+  await producer.disconnect();
 }

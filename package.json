@@ -10,7 +10,9 @@
   "scripts": {
     "test": "jest --detectOpenHandles",
     "test:watch": "jest --watch",
-    "seed": "node ci/scripts/seed-testdata.js"
+    "seed": "node ci/scripts/seed-testdata.js",
+    "build": "tsc --project tsconfig.json",
+    "watch": "tsc --project tsconfig.json --watch"
   },
   "repository": {
     "type": "git",
