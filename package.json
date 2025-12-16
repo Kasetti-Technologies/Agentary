@@ -8,6 +8,7 @@
     "doc": "docs"
   },
   "scripts": {
+    "billing:dev": "ts-node src/billing-aggregator-main.ts",
     "test": "jest --detectOpenHandles",
     "test:watch": "jest --watch",
     "seed": "node ci/scripts/seed-testdata.js",

@@ -17,6 +17,7 @@ STAGING_API_URL=http://localhost:3000/api/v1/usage-events
 # Kafka Broker Connection
 # Tells the application where to find the Kafka service.
 KAFKA_BROKER=localhost:9092
+KAFKA_BROKERS=localhost:9092
 
 # JWKS URI for Token Validation
 # Used by the tenantContext middleware to validate JWTs.
@@ -25,6 +26,16 @@ JWKS_URI=https://your-auth-provider.com/.well-known/jwks.json
 # KMS Signing Key ID for Artifact Signer
 # A placeholder key ID for the artifact signing service.
 SIGNING_KEY_ID=abc-123-local-key
+
+# Credential broker configuration
+CREDENTIAL_BROKER_URL=http://localhost:8080/api/v1/broker/issue
+SERVICE_ID=driver-runtime
+TENANT_ID=tenant-123
+CREDENTIAL_ROTATION_SAFETY_SECONDS=60
+CREDENTIAL_ROTATION_RETRY_SECONDS=10
+
+# HTTP port for the runtime
+PORT=3000
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary
@@ -128,7 +139,9 @@ components:
   "scripts": {
     "test": "jest --detectOpenHandles",
     "test:watch": "jest --watch",
-    "seed": "node ci/scripts/seed-testdata.js"
+    "seed": "node ci/scripts/seed-testdata.js",
+    "build": "tsc --project tsconfig.json",
+    "watch": "tsc --project tsconfig.json --watch"
   },
   "repository": {
     "type": "git",
@@ -27999,6 +28012,61 @@ class DriverService {
 module.exports = new DriverService();
 
 
+### Folder: C:\Users\Admin\Documents\Github\Agentary\services
+
+===== TenantDriverSelectionService.js =====
+// services/TenantDriverSelectionService.js
+
+// Reâ€‘use your existing DB helper
+const db = require('../database');
+
+class TenantDriverSelectionService {
+  /**
+   * Insert a selection row for a tenant/driver.
+   * Columns assume:
+   *   tenant_driver_selections(
+   *     selection_id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+   *     tenant_id     UUID NOT NULL,
+   *     driver_id     UUID NOT NULL,
+   *     selected_by   TEXT,
+   *     created_at    TIMESTAMPTZ DEFAULT now(),
+   *     selected_tables JSONB NULL
+   *   )
+   */
+  async selectDriver({ tenantId, driverId, selectedBy }) {
+    const result = await db.query(
+      `
+      INSERT INTO tenant_driver_selections (tenant_id, driver_id, selected_by)
+      VALUES ($1, $2, $3)
+      RETURNING *;
+      `,
+[tenantId, driverId, selectedBy | null]
+
+    );
+
+    return result.rows[0];
+  }
+
+  /**
+   * (Optional) Get all selections for a tenant, useful for future UI.
+   */
+  async listSelectionsForTenant(tenantId) {
+    const result = await db.query(
+      `
+      SELECT *
+      FROM tenant_driver_selections
+      WHERE tenant_id = $1
+      ORDER BY created_at DESC;
+      `,
+      [tenantId]
+    );
+    return result.rows;
+  }
+}
+
+module.exports = new TenantDriverSelectionService();
+
+
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\services\catalog\jobs
 
 ===== signArtifactsJob.ts =====
@@ -28159,42 +28227,50 @@ module.exports = new KafkaProducer();
 
 ===== app.ts =====
 import express from 'express';
-import { tenantContextMiddleware, releaseDbClientMiddleware } from './middleware/tenantContext.middleware';
-// ... other router imports
-import { usageEventsRouter } from './routes/usageEvents.router'; // <-- IMPORT THE NEW ROUTER
+import type { Request, Response, NextFunction } from 'express';
+import {
+  tenantContextMiddleware,
+  releaseDbClientMiddleware,
+} from './middleware/tenantContext.middleware';
+import { usageEventsRouter } from './routes/usageEvents.router';
 
 const app = express();
-app.use(express.json()); // <-- IMPORTANT: Add body parser for JSON
 
-// 1. --- Critical Setup Middleware ---
-app.use(tenantContextMiddleware);
+app.use(express.json());               // JSON body parser
+app.use(tenantContextMiddleware);      //  Critical Setup Middleware
+app.use('/api/v1/usage-events', usageEventsRouter); //  Routes
+app.use(releaseDbClientMiddleware);   //  Cleanup Middleware
 
-// 2. --- Define Routes ---
-// ... your other routes
-app.use('/api/v1/usage-events', usageEventsRouter); // <-- REGISTER THE NEW ROUTER
+//  Centralized Error Handler (typed)
+app.use(
+  (
+    err: unknown,
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    console.error(err);
 
-// 3. --- Cleanup Middleware ---
-app.use(releaseDbClientMiddleware);
+    if (
+      typeof err === 'object' &&
+      err !== null &&
+      'message' in err &&
+      (err as any).message.includes('UsageEvent schema validation failed')
+    ) {
+      const message = (err as any).message as string;
+      return res.status(422).json({
+        code: 'VALIDATION_ERROR',
+        message: 'Request body does not conform to usagepilot.v1 schema.',
+        details: JSON.parse(message.split(': ')[1]),
+      });
+    }
 
-// 4. --- Centralized Error Handler ---
-app.use((err, req, res, next) => {
-  console.error(err); // Log the error
-  
-  // Handle AJV validation errors specifically
-  if (err.message.includes('UsageEvent schema validation failed')) {
-    return res.status(422).json({
-      code: 'VALIDATION_ERROR',
-      message: 'Request body does not conform to usagepilot.v1 schema.',
-      details: JSON.parse(err.message.split(': ')[1])
+    res.status(500).json({
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred.',
     });
   }
-
-  // Generic error response
-  res.status(500).json({
-    code: 'INTERNAL_SERVER_ERROR',
-    message: 'An unexpected error occurred.',
-  });
-});
+);
 
 export default app;
 
@@ -28202,14 +28278,47 @@ export default app;
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src
 
 ===== index.js =====
+// src/index.js
+require('dotenv/config');
 const express = require('express');
 const { Kafka, logLevel } = require('kafkajs');
+const selectionRoutes = require('./routes/selections');
 
-// Kafka configuration
+
+// ---- Credential broker + rotation (from dist build) ----
+const { CredentialBrokerClient } = require('../dist/runtime/CredentialBrokerClient');
+const { CredentialRotator } = require('../dist/runtime/CredentialRotator');
+
+// ---- UsageForwarder (from dist build) ----
+const { UsageForwarder } = require('../dist/runtime/UsageForwarder');
+
+/**
+ * Small helper to require environment variables with an optional default.
+ */
+
+
+function requireEnv(name, defaultValue) {
+  const value = process.env[name] || defaultValue;
+  if (!value) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return value;
+}
+
+// ---------- Helpers ----------
+function getEnv(name, fallback) {
+  const val = process.env[name] ?? fallback;
+  if (!val) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return val;
+}
+
+// ---------- Kafka producer ----------
 const kafka = new Kafka({
   clientId: 'my-service',
   brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
-  logLevel: logLevel.INFO,
+  logLevel: logLevel.INFO, // <- fixed
 });
 
 const producer = kafka.producer();
@@ -28231,12 +28340,12 @@ async function publishUsageEvent({
 }) {
   const topic = `usage.${servicetype}`;
   const headers = {
-    XTenantContext: XTenantContext || '',
-    XCorrelationId: XCorrelationId || '',
-    idempotencykey: idempotencykey || '',
-    eventhash: eventhash || '',
-    regiontag: regiontag || '',
-  };
+  XTenantContext: XTenantContext || '',
+  XCorrelationId: XCorrelationId || '',
+  idempotencykey: idempotencykey || '',
+  eventhash: eventhash || '',
+  regiontag: regiontag || '',
+};
 
   await producer.send({
     topic,
@@ -28252,40 +28361,31 @@ async function publishUsageEvent({
   console.log(`Published to ${topic} for tenant ${tenantid}`);
 }
 
-// Health HTTP server
+// ---------- Health HTTP server ----------
 function startHttpServer() {
   const app = express();
-  const port = process.env.PORT || 3000;
+const port = process.env.PORT | 3000;
 
   app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
   });
+const PORT = process.env.PORT | 3000;
 
   app.listen(port, () => {
     console.log(`Health server listening on port ${port}`);
   });
 }
 
-// If this file is run directly (node src/index.js), start HTTP + Kafka
-if (require.main === module) {
-  // Start HTTP server first so /health works even if Kafka is down
-  startHttpServer();
-
-  // Try to connect Kafka in the background, but don't kill the process if it fails
-  connectProducer()
-    .then(() => {
-      console.log('Kafka producer connected');
-    })
-    .catch((err) => {
-      console.error('Kafka producer connection failed (continuing without Kafka)', err);
-      // No process.exit(1) here
-    });
-}
-
-// Orchestrator provisioned event + audit logging
+// ---------- Orchestrator provisioned event + audit logging ----------
 const ORCHESTRATOR_TOPIC = 'orchestrator.provisioned';
 
-async function emitProvisionEvent({ tenantId, serviceType, deploymentName, status, error }) {
+async function emitProvisionEvent({
+  tenantId,
+  serviceType,
+  deploymentName,
+  status,
+  error,
+}) {
   if (!producer) {
     console.error('emitProvisionEvent: producer not initialized');
     return;
@@ -28305,7 +28405,7 @@ async function emitProvisionEvent({ tenantId, serviceType, deploymentName, statu
       topic: ORCHESTRATOR_TOPIC,
       messages: [
         {
-          key: tenantId || 'unknown',
+          key: tenantId | 'unknown', // <- fixed; was tenantId | 'unknown'
           value: JSON.stringify(payload),
         },
       ],
@@ -28315,7 +28415,13 @@ async function emitProvisionEvent({ tenantId, serviceType, deploymentName, statu
   }
 }
 
-function auditProvision({ tenantId, serviceType, deploymentName, status, error }) {
+function auditProvision({
+  tenantId,
+  serviceType,
+  deploymentName,
+  status,
+  error,
+}) {
   const entry = {
     ts: new Date().toISOString(),
     type: 'orchestrator.provision',
@@ -28327,6 +28433,116 @@ function auditProvision({ tenantId, serviceType, deploymentName, status, error }
   };
   console.log(JSON.stringify(entry));
 }
+
+// ---------- Bootstrap: credentials + HTTP + Kafka + UsageForwarder ----------
+let rotator; // so the shutdown handler can see it
+
+async function bootstrap() {
+  // 1) Start credential rotation (R-003)
+  const brokerUrl = getEnv('CREDENTIAL_BROKER_URL');
+  const serviceId = getEnv('SERVICE_ID', 'driver-runtime');
+  const tenantId = getEnv('TENANT_ID');
+
+  const rotationSafetySeconds = Number(
+    getEnv('CREDENTIAL_ROTATION_SAFETY_SECONDS', '60'),
+  );
+  const retryDelaySeconds = Number(
+    getEnv('CREDENTIAL_ROTATION_RETRY_SECONDS', '10'),
+  );
+
+  const brokerClient = new CredentialBrokerClient(brokerUrl, serviceId);
+  rotator = new CredentialRotator(brokerClient, {
+    tenantId,
+    correlationId: undefined,
+    rotationSafetySeconds,
+    retryDelaySeconds,
+  });
+
+  // Wait for first credential so the runtime can use it
+  await rotator.start();
+  console.log('[Bootstrap] Credential rotation started');
+
+  // 2) Start HTTP health server
+  startHttpServer();
+
+  // 3) Connect Kafka in background (do not crash on failure)
+  connectProducer()
+    .then(() => {
+      console.log('Kafka producer connected');
+    })
+    .catch((err) => {
+      console.error(
+        'Kafka producer connection failed (continuing without Kafka)',
+        err,
+      );
+      // no process.exit(1) on purpose
+    });
+
+  // 4) UsageForwarder initialization (R-004)
+  const meteringEndpoint =
+  process.env.METERING_API_URL ||
+  'http://localhost:4000/api/v1/usage-events'; // adjust to your metering API URL
+
+const primaryRegion = process.env.PRIMARY_REGION || 'us-east-1';
+
+const tenantContextJwt = requireEnv(
+  'TENANT_CONTEXT_JWT',
+  'MOCK.JWT.TOKEN' // dev default; replace with real JWT in staging/prod
+);
+
+const usageForwarder = new UsageForwarder({
+  endpoint: meteringEndpoint,
+  tenantId,
+  primaryRegion,
+  tenantContextJwt,
+  baseCorrelationId: `runtime-${tenantId}-${Date.now()}`,
+  flushIntervalMs: 5000,
+  maxBatchSize: 20,
+});
+
+usageForwarder.start();
+
+console.log('[Bootstrap] UsageForwarder started, endpoint:', meteringEndpoint);
+  // OPTIONAL: emit a test usage event every 30s
+  setInterval(() => {
+    usageForwarder.record('nlp.udf_call', 1, {
+      source: 'runtime-test',
+      note: 'R-004 test event from container',
+    });
+    console.log('[UsageForwarder] queued test usage event');
+  }, 30000);
+
+  // 5) Graceful shutdown
+  const shutdown = () => {
+    console.log('[Bootstrap] Shutting down...');
+    try {
+      if (rotator) {
+        rotator.stop();
+      }
+    } catch (e) {
+      console.error('Error stopping rotator', e);
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+// Only run bootstrap when this file is run directly
+if (require.main === module) {
+  bootstrap().catch((err) => {
+    console.error('[Bootstrap] Fatal error:', err);
+    process.exit(1);
+  });
+}
+
+// Export things if other modules need them
+module.exports = {
+  publishUsageEvent,
+  emitProvisionEvent,
+  auditProvision,
+};
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\controllers
@@ -28372,6 +28588,7 @@ export async function getArtifactPublicKey(req: Request, res: Response) {
 // Import the services needed by this controller
 const DriverService = require('../services/DriverService');
 const ArtifactService = require('../services/ArtifactService'); // You will need to create/import this service
+const TenantDriverSelectionService = require('../services/TenantDriverSelectionService');
 
 class DriverController {
     /**
@@ -28437,10 +28654,172 @@ class DriverController {
             next(error);
         }
     }
+    async listCatalogDrivers(req, res, next) {
+    try {
+      // Prefer tenant_id from TenantContext if you have it
+      // Adjust these property names to your actual auth/middleware
+      const tenantFromContext =
+        (req.tenant && req.tenant.tenant_id) ||
+        (req.tenantContext && req.tenantContext.tenant_id) ||
+        (req.user && req.user.tenant_id);
+
+      if (!tenantFromContext) {
+        return res.status(400).json({
+          error: 'Tenant context missing for catalog request',
+        });
+      }
+
+      const drivers = await DriverService.getAvailableDriversForTenant(
+        tenantFromContext
+      );
+
+      return res.status(200).json(drivers);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * [New] Select a driver for a tenant.
+   * POST /tenant/:tenantId/drivers/:driverId/select
+   */
+  async selectDriver(req, res, next) {
+    try {
+      const { tenantId, driverId } = req.params;
+
+      // Crossâ€‘check with TenantContext if available
+      const tenantFromContext =
+        (req.tenant && req.tenant.tenant_id) ||
+        (req.tenantContext && req.tenantContext.tenant_id) ||
+        (req.user && req.user.tenant_id);
+
+      if (
+        tenantFromContext &&
+        String(tenantFromContext) !== String(tenantId)
+      ) {
+        return res.status(403).json({
+          error:
+            'Tenant mismatch between URL and authenticated context. Request forbidden.',
+        });
+      }
+
+      // Who is performing the selection? Use your auth user or tenant sub
+      const selectedBy =
+        (req.user && (req.user.id || req.user.email)) ||
+        (req.tenant && req.tenant.sub) ||
+        null;
+
+      if (!driverId) {
+        return res
+          .status(400)
+          .json({ error: 'driverId parameter is required' });
+      }
+
+      const selection = await TenantDriverSelectionService.selectDriver({
+        tenantId,
+        driverId,
+        selectedBy,
+      });
+
+      return res.status(201).json({
+        selection_id: selection.selection_id || selection.id,
+        tenant_id: selection.tenant_id,
+        driver_id: selection.driver_id,
+        selected_by: selection.selected_by,
+        created_at: selection.created_at,
+        status: 'selected',
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
 }
 
 // Export a single instance of the controller
 module.exports = new DriverController();
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\controllers
+
+===== SelectionController.js =====
+// src/controllers/SelectionController.js
+
+const {
+  checkSelectionAgainstPlan,
+  getPlanLimitsForTenant,
+  saveSelection,
+} = require('../services/SelectionService');
+
+/**
+ * POST /tenant/:tenant_id/selections
+ *
+ * Body example:
+ * {
+ *   "driverId": "d2b4f1c0-....",
+ *   "selections": [
+ *     { "schema": "public", "table": "orders", "columns": ["id", "amount"] },
+ *     { "schema": "public", "table": "customers", "columns": ["id", "email"] }
+ *   ]
+ * }
+ */
+async function postSelections(req, res) {
+  const tenantId = req.params.tenant_id;
+
+  // Pull "selected_by" from your auth / TenantContext middleware.
+  // Adjust this to match what you actually put on req.user.
+  const user = req.user | (req.auth && req.auth.user) | {};
+  const selectedBy =
+    user.id |
+    user.user_id ||
+    user.sub || // common JWT claim
+    '00000000-0000-0000-0000-000000000000'; // fallback; you can tighten this later
+
+  const body = req.body || {};
+
+  if (!body.driverId || !Array.isArray(body.selections)) {
+    return res.status(400).json({
+      code: 'INVALID_REQUEST',
+      message: 'driverId and selections[] are required.',
+    });
+  }
+
+  try {
+    const limits = await getPlanLimitsForTenant(tenantId, body.driverId);
+    const result = checkSelectionAgainstPlan(body, limits);
+
+    if (!result.ok) {
+      // Over plan limits â†’ 409.LIMIT_EXCEEDED
+      return res.status(409).json({
+        code: 'LIMIT_EXCEEDED',
+        reason: result.reason,
+        usedTables: result.usedTables,
+        usedFields: result.usedFields,
+        maxTables: result.maxTables,
+        maxFields: result.maxFields,
+      });
+    }
+
+    await saveSelection(tenantId, selectedBy, body);
+
+    return res.status(200).json({
+      status: 'success',
+      usedTables: result.usedTables,
+      usedFields: result.usedFields,
+      maxTables: result.maxTables,
+      maxFields: result.maxFields,
+    });
+  } catch (err) {
+    console.error('Error in postSelections:', err);
+    return res.status(500).json({
+      code: 'INTERNAL_ERROR',
+      message: 'Failed to save selection.',
+    });
+  }
+}
+
+module.exports = {
+  postSelections,
+};
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\controllers
@@ -28818,6 +29197,283 @@ export function releaseDbClientMiddleware(req: Request, res: Response, next: Nex
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator
 
+===== artifact-fetch.ts =====
+// src/orchestrator/artifact-fetch.ts
+import axios from 'axios';
+import { createWriteStream, promises as fs } from 'fs';
+import path from 'path';
+import { computeSha256 } from './utils/sha256';
+import { verifyEcdsaP384 } from './utils/ecdsa-verify';
+import { emitArtifactFailed, initKafka } from './kafka-producer';
+import { logger } from './logging';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import type { Readable } from 'stream';   // <-- only for typing the stream
+
+const execAsync = promisify(exec);
+
+/** ENTRY POINT â€“ called by the init container.
+ *  All required configuration is passed via environment variables.
+ */
+async function run(): Promise<void> {
+  // -----------------------------------------------------------------
+  // Load and validate required env vars (fail fast)
+  // -----------------------------------------------------------------
+  const {
+    ARTIFACT_URI,
+    ARTIFACT_SHA256,
+    ARTIFACT_SIG_URI,
+    PUBLIC_KEY_URI,
+    TARGET_DIR,
+    TENANT_ID,
+    ARTIFACT_ID,
+    CORRELATION_ID,
+  } = process.env;
+
+  if (
+    !ARTIFACT_URI ||
+    !ARTIFACT_SHA256 ||
+    !ARTIFACT_SIG_URI ||
+    !PUBLIC_KEY_URI ||
+    !TARGET_DIR ||
+    !TENANT_ID ||
+    !ARTIFACT_ID
+  ) {
+    logger.error('Missing required environment variables for artifact fetch');
+    process.exit(1);
+  }
+
+  // -----------------------------------------------------------------
+  // Prepare a temporary directory for downloads
+  // -----------------------------------------------------------------
+  const tmpDir = await fs.mkdtemp(path.join('/tmp', 'artifact-'));
+  const artifactPath = path.join(tmpDir, 'artifact.pkg');
+
+  try {
+    // -----------------------------------------------------------------
+    // DOWNLOAD THE ARTIFACT BINARY
+    // -----------------------------------------------------------------
+    logger.info('Downloading artifact', { uri: ARTIFACT_URI });
+
+    // `axios.get<Readable>` tells TS that the response data is a stream.
+    const resp = await axios.get<Readable>(ARTIFACT_URI, {
+      responseType: 'stream',
+    });
+
+    const writer = createWriteStream(artifactPath);
+    resp.data.pipe(writer);
+
+    // Resolve only when the stream finishes; wrap resolve to match the
+    // listener signature (`() => void`).
+    await new Promise<void>((resolve, reject) => {
+      writer.on('finish', () => resolve());
+      writer.on('error', reject);
+    });
+
+    logger.info('Artifact downloaded', { path: artifactPath });
+
+    // -----------------------------------------------------------------
+    // VERIFY SHAâ€‘256 CHECKSUM
+    // -----------------------------------------------------------------
+    const actualHash = await computeSha256(artifactPath);
+    if (actualHash !== ARTIFACT_SHA256.toLowerCase()) {
+      const reason = `checksum mismatch (expected ${ARTIFACT_SHA256}, got ${actualHash})`;
+      await emitArtifactFailed({
+        tenantId: TENANT_ID,
+        artifactId: ARTIFACT_ID,
+        reason,
+      });
+      logger.error(reason);
+      process.exit(1);
+    }
+    logger.info('Checksum verified');
+
+    // -----------------------------------------------------------------
+    // FETCH SIGNATURE & PUBLIC KEY (plainâ€‘text files)
+    // -----------------------------------------------------------------
+    const [sigResp, keyResp] = await Promise.all([
+      // Explicitly type as string so `data` is known to be a string.
+      axios.get<string>(ARTIFACT_SIG_URI, { responseType: 'text' }),
+      axios.get<string>(PUBLIC_KEY_URI, { responseType: 'text' }),
+    ]);
+
+    const signatureB64 = sigResp.data.trim();
+    const publicKeyPem = keyResp.data;
+
+    // -----------------------------------------------------------------
+    // VERIFY ECDSAâ€¯Pâ€‘384 SIGNATURE
+    // -----------------------------------------------------------------
+    const artifactBytes = await fs.readFile(artifactPath);
+    const isValid = verifyEcdsaP384(artifactBytes, signatureB64, publicKeyPem);
+    if (!isValid) {
+      const reason = 'ECDSA signature verification failed';
+      await emitArtifactFailed({
+        tenantId: TENANT_ID,
+        artifactId: ARTIFACT_ID,
+        reason,
+      });
+      logger.error(reason);
+      process.exit(1);
+    }
+    logger.info('Signature verified');
+
+    // -----------------------------------------------------------------
+    // EXTRACT ARTIFACT INTO THE TARGET DIRECTORY
+    // -----------------------------------------------------------------
+    await fs.mkdir(TARGET_DIR, { recursive: true });
+    // Assuming a tar.gz; adjust if you use zip or another format.
+    await execAsync(`tar -xzf ${artifactPath} -C ${TARGET_DIR}`);
+    logger.info('Artifact extracted', { target: TARGET_DIR });
+
+    // -----------------------------------------------------------------
+    // SUCCESS â€“ exit 0 so the main container can start
+    // -----------------------------------------------------------------
+    process.exit(0);
+  } catch (err) {
+    // -----------------------------------------------------------------
+    // ANY UNEXPECTED ERROR â†’ emit failure event & exit 1
+    // -----------------------------------------------------------------
+    const reason = `runtime error: ${(err as Error).message}`;
+    await emitArtifactFailed({
+      tenantId: TENANT_ID,
+      artifactId: ARTIFACT_ID,
+      reason,
+    });
+    logger.error('Artifact fetch failed', { error: err });
+    process.exit(1);
+  }
+}
+
+/* -------------------------------------------------------------
+   Bootstrap â€“ connect to Kafka before running the logic.
+   ------------------------------------------------------------- */
+(async () => {
+  try {
+    await initKafka();
+    await run();
+  } catch (e) {
+    logger.error('Fatal init error', { error: e });
+    process.exit(1);
+  }
+})();
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator
+
+===== kafka-producer.ts =====
+// src/orchestrator/kafka-producer.ts
+import { Kafka, Producer, Message } from 'kafkajs';
+import { logger } from './logging';   // tiny logger we added earlier
+
+// ---------------------------------------------------------------------
+// Kafka client & producer (single instance for the whole orchestrator)
+// ---------------------------------------------------------------------
+const kafka = new Kafka({
+  clientId: 'agentary-orchestrator',
+  brokers: (process.env.KAFKA_BROKERS?.split(',') ?? ['localhost:9092']),
+});
+
+const producer: Producer = kafka.producer();
+
+/** Connect the producer once at application startâ€‘up */
+export async function initKafka(): Promise<void> {
+  await producer.connect();
+}
+
+/** Payload for a verificationâ€‘failed event */
+export interface ArtifactFailure {
+  tenantId: string;
+  artifactId: string;
+  reason: string;
+}
+
+/** Publish a failure event â€“ called only on verification errors */
+export async function emitArtifactFailed(
+  event: ArtifactFailure,
+): Promise<void> {
+  // -----------------------------------------------------------------
+  // Build a `Message` that matches kafkajsâ€™ expected shape.
+  // -----------------------------------------------------------------
+  const kafkaMsg: Message = {
+    // Keys may be strings, but using Buffer makes the type explicit.
+    key: Buffer.from(event.tenantId),
+
+    // Store the JSON payload as bytes.
+    value: Buffer.from(JSON.stringify(event)),
+
+    // Header values **must be Buffers** (or Uint8Array). This satisfies the
+    // `Message.headers` type: `{ [key: string]: Buffer }`.
+    headers: {
+      'tenant-id': Buffer.from(event.tenantId),
+      'correlation-id': Buffer.from(process.env.CORRELATION_ID ?? ''),
+    },
+  };
+
+  // -----------------------------------------------------------------
+  // Send the message.  No generic needed because `kafkaMsg` already
+  // conforms to `Message` (the generic `T` is inferred as `any`/`unknown`).
+  // -----------------------------------------------------------------
+  await producer.send({
+    topic: 'artifact.verification_failed',
+    messages: [kafkaMsg],
+  });
+
+  logger.warn('artifact.verification_failed emitted', { event });
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator
+
+===== logging.ts =====
+// src/orchestrator/logging.ts
+/**
+ * Very small logger that mirrors the API used in the codebase.
+ * If you later need structured JSON logging, replace the implementation
+ * with winston/pino â€“ the public interface stays the same.
+ */
+export const logger = {
+  /** Log an informational message. */
+  info: (msg: string, meta?: Record<string, unknown>) => {
+    if (meta) {
+      console.info(`[INFO] ${msg}`, JSON.stringify(meta));
+    } else {
+      console.info(`[INFO] ${msg}`);
+    }
+  },
+
+  /** Log a warning. */
+  warn: (msg: string, meta?: Record<string, unknown>) => {
+    if (meta) {
+      console.warn(`[WARN] ${msg}`, JSON.stringify(meta));
+    } else {
+      console.warn(`[WARN] ${msg}`);
+    }
+  },
+
+  /** Log an error. */
+  error: (msg: string, meta?: Record<string, unknown>) => {
+    if (meta) {
+      console.error(`[ERROR] ${msg}`, JSON.stringify(meta));
+    } else {
+      console.error(`[ERROR] ${msg}`);
+    }
+  },
+
+  /** Optional debug level â€“ useful during local dev. */
+  debug: (msg: string, meta?: Record<string, unknown>) => {
+    if (process.env.NODE_ENV !== 'production') {
+      if (meta) {
+        console.debug(`[DEBUG] ${msg}`, JSON.stringify(meta));
+      } else {
+        console.debug(`[DEBUG] ${msg}`);
+      }
+    }
+  },
+};
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator
+
 ===== provisioner.ts =====
 import * as k8s from '@kubernetes/client-node';
 
@@ -29185,6 +29841,54 @@ if (isDirectRun) {
 }
 
 
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator\utils
+
+===== ecdsa-verify.ts =====
+// src/orchestrator/utils/ecdsa-verify.ts
+import { createVerify } from 'crypto';
+
+/**
+ * Verify an ECDSAâ€¯Pâ€‘384 signature.
+ * @param data            â€“ Buffer containing the signed payload (the checksum in our case).
+ * @param signatureB64    â€“ Baseâ€‘64 encoded signature from the artifact metadata.
+ * @param publicKeyPem    â€“ PEMâ€‘encoded public key.
+ * @returns true if the signature is valid.
+ */
+export function verifyEcdsaP384(
+  data: Buffer,
+  signatureB64: string,
+  publicKeyPem: string,
+): boolean {
+  const verifier = createVerify('SHA256');
+  verifier.update(data);
+  verifier.end();
+  const signature = Buffer.from(signatureB64, 'base64');
+  return verifier.verify(publicKeyPem, signature);
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\orchestrator\utils
+
+===== sha256.ts =====
+// src/orchestrator/utils/sha256.ts
+import { createReadStream } from 'fs';
+import { createHash } from 'crypto';
+
+/**
+ * Compute SHAâ€‘256 of a file on disk.
+ * Returns the hexâ€‘encoded digest.
+ */
+export async function computeSha256(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
 
 ===== admin.js =====
@@ -29251,6 +29955,59 @@ module.exports = router;
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
 
+===== clientDrivers.js =====
+// src/routes/clientDrivers.js
+const express = require('express');
+const router = express.Router();
+
+const DriverController = require('../controllers/DriverController');
+const { authMiddleware } = require('../middleware/auth');
+// If you have TenantContext middleware, import it here:
+// const { tenantContextMiddleware } = require('../middleware/tenantContext.middleware');
+
+// List catalog drivers for the authenticated tenant
+router.get(
+  '/catalog/drivers',
+  authMiddleware,
+  // tenantContextMiddleware, // uncomment if available
+  (req, res, next) => DriverController.listCatalogDrivers(req, res, next)
+);
+
+// Select a driver for a tenant
+router.post(
+  '/tenant/:tenantId/drivers/:driverId/select',
+  authMiddleware,
+  // tenantContextMiddleware, // uncomment if available
+  (req, res, next) => DriverController.selectDriver(req, res, next)
+);
+
+module.exports = router;
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
+
+===== selections.js =====
+// src/routes/selections.js
+const express = require('express');
+const router = express.Router();
+
+const { postSelections } = require('../controllers/SelectionController');
+// If you want to protect this later, you can re-enable auth:
+// const { authMiddleware } = require('../middleware/auth');
+
+// POST /tenant/:tenant_id/selections
+router.post(
+  '/tenant/:tenant_id/selections',
+  express.json(),      // ensure JSON body parsing for this route
+  // authMiddleware,    // <-- keep commented while testing without JWT
+  postSelections
+);
+
+module.exports = router;
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
+
 ===== usageEvents.router.ts =====
 import { Router } from 'express';
 import { ingestUsageEventHandler } from '../controllers/usageEvents.controller';
@@ -29261,6 +30018,401 @@ const router = Router();
 router.post('/', ingestUsageEventHandler);
 
 export { router as usageEventsRouter };
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== credentialBrokerClient.ts =====
+import axios from "axios";
+
+export interface IssuedCredential {
+  accessToken: string;
+  expiresAt: Date;
+  issuedAt: Date;
+  tenantId: string;
+  serviceId: string;
+}
+
+// Optional: describe the brokerâ€™s JSON shape for stronger typing
+interface BrokerIssueResponse {
+  access_token: string;
+  expires_at: string;
+  issued_at: string;
+  tenant_id: string;
+  service_id: string;
+}
+
+export class CredentialBrokerClient {
+  private brokerUrl: string;
+  private serviceId: string;
+
+  constructor(brokerUrl: string, serviceId: string) {
+    this.brokerUrl = brokerUrl;
+    this.serviceId = serviceId;
+  }
+
+  async issueCredential(
+    tenantId: string,
+    correlationId?: string
+  ): Promise<IssuedCredential> {
+    const body = {
+      tenant_id: tenantId,
+      service_id: this.serviceId,
+    };
+
+    const headers: Record<string, string> = {};
+    if (correlationId) {
+      headers["X-Correlation-Id"] = correlationId;
+    }
+
+    // NOTE: no AxiosResponse import; we type the response body instead
+    const response = await axios.post<BrokerIssueResponse>(this.brokerUrl, body, {
+      headers,
+    });
+    const data = response.data;
+
+    return {
+      accessToken: data.access_token,
+      expiresAt: new Date(data.expires_at),
+      issuedAt: new Date(data.issued_at),
+      tenantId: data.tenant_id,
+      serviceId: data.service_id,
+    };
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== CredentialRotator.ts =====
+// src/runtime/CredentialRotator.ts
+import { CredentialBrokerClient } from "./credentialBrokerClient";
+import { globalCredentialStore } from "./credentialStore";
+
+export interface CredentialRotatorOptions {
+  tenantId: string;
+  correlationId?: string;
+  rotationSafetySeconds: number; // seconds before expiry to refresh
+  retryDelaySeconds: number;     // seconds between retries on failure
+}
+
+type RefreshReason = "startup" | "scheduled" | "retry";
+
+export class CredentialRotator {
+  private client: CredentialBrokerClient;
+  private opts: CredentialRotatorOptions;
+  private timer: NodeJS.Timeout | null = null;
+  private stopped = false;
+
+  constructor(client: CredentialBrokerClient, opts: CredentialRotatorOptions) {
+    this.client = client;
+    this.opts = opts;
+  }
+
+  async start(): Promise<void> {
+    this.stopped = false;
+    await this.refreshOnce("startup");
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private async refreshOnce(reason: RefreshReason): Promise<void> {
+    if (this.stopped) return;
+
+    try {
+      const cred = await this.client.issueCredential(
+        this.opts.tenantId,
+        this.opts.correlationId
+      );
+
+      globalCredentialStore.set(cred);
+
+      console.log(
+        `[CredentialRotator] (${reason}) issued credential for tenant=${cred.tenantId}, ` +
+          `service=${cred.serviceId}, expires_at=${cred.expiresAt.toISOString()}`
+      );
+
+      this.scheduleNext(cred.expiresAt);
+    } catch (err) {
+      console.error("[CredentialRotator] Error fetching credential:", err);
+      this.scheduleRetry();
+    }
+  }
+
+  private scheduleNext(expiresAt: Date): void {
+    if (this.stopped) return;
+
+    const now = Date.now();
+    const expiryMs = expiresAt.getTime();
+    let delayMs =
+      expiryMs - now - this.opts.rotationSafetySeconds * 1000;
+
+    // Ensure we don't schedule insanely short intervals (< 5s)
+    if (delayMs < 5000) {
+      delayMs = 5000;
+    }
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+    }
+
+    this.timer = setTimeout(() => {
+      this.refreshOnce("scheduled").catch((err) => {
+        console.error(
+          "[CredentialRotator] Error in scheduled refresh:",
+          err
+        );
+      });
+    }, delayMs);
+
+    console.log(
+      `[CredentialRotator] next refresh scheduled in ${Math.round(
+        delayMs / 1000
+      )}s (before expiry)`
+    );
+  }
+
+  private scheduleRetry(): void {
+    if (this.stopped) return;
+
+    const delayMs = this.opts.retryDelaySeconds * 1000;
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+    }
+
+    this.timer = setTimeout(() => {
+      this.refreshOnce("retry").catch((err) => {
+        console.error(
+          "[CredentialRotator] Error in retry refresh:",
+          err
+        );
+      });
+    }, delayMs);
+
+    console.log(
+      `[CredentialRotator] retry scheduled in ${this.opts.retryDelaySeconds}s due to previous failure`
+    );
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== credentialStore.ts =====
+// src/runtime/CredentialStore.ts
+import type { IssuedCredential } from "./credentialBrokerClient";
+
+export class CredentialStore {
+  private current: IssuedCredential | null = null;
+
+  set(cred: IssuedCredential): void {
+    this.current = cred;
+  }
+
+  get(): IssuedCredential {
+    if (!this.current) {
+      throw new Error("No credential loaded yet");
+    }
+    return this.current;
+  }
+
+  hasCredential(): boolean {
+    return this.current !== null;
+  }
+}
+
+// Global singleton store for the process
+export const globalCredentialStore = new CredentialStore();
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== UsageForwarder.ts =====
+import axios from "axios";
+import { randomUUID } from "crypto";
+
+export interface RuntimeUsageEvent {
+  metric: string;
+  quantity: number;
+  properties?: Record<string, unknown>;
+}
+
+/**
+ * Configuration for the UsageForwarder.
+ * - endpoint: Metering API ingestion endpoint (e.g. http://localhost:4000/api/v1/usage-events)
+ * - tenantId: current tenant UUID (used in payload)
+ * - primaryRegion: region tag for events (used in payload)
+ * - tenantContextJwt: signed Xâ€‘Tenantâ€‘Context JWT (passed in HTTP header)
+ * - baseCorrelationId: optional base correlation id to reuse/derive from
+ * - flushIntervalMs: how often to flush queued events (ms)
+ * - maxBatchSize: max events per flush
+ */
+export interface UsageForwarderOptions {
+  endpoint: string;
+  tenantId: string;
+  primaryRegion: string;
+  tenantContextJwt: string;
+  baseCorrelationId?: string;
+  flushIntervalMs?: number;
+  maxBatchSize?: number;
+}
+
+/**
+ * UsageForwarder:
+ *  - Collects runtime usage events via record()
+ *  - Periodically flushes them to the metering API as individual POSTs
+ *  - Attaches Xâ€‘Tenantâ€‘Context and Xâ€‘Correlationâ€‘Id headers
+ *
+ * NOTE: This is intentionally simple. You can later:
+ *  - add smarter batching (bulk payloads),
+ *  - add 429 Retryâ€‘After + exponential backoff with jitter, etc. @54
+ */
+export class UsageForwarder {
+  private readonly http: ReturnType<typeof axios.create>;
+  private readonly opts: Required<UsageForwarderOptions>;
+  private readonly queue: RuntimeUsageEvent[] = [];
+  private flushTimer?: NodeJS.Timeout;
+
+  constructor(options: UsageForwarderOptions) {
+    if (!options.endpoint) {
+      throw new Error("UsageForwarder: endpoint is required");
+    }
+    if (!options.tenantId) {
+      throw new Error("UsageForwarder: tenantId is required");
+    }
+    if (!options.primaryRegion) {
+      throw new Error("UsageForwarder: primaryRegion is required");
+    }
+    if (!options.tenantContextJwt) {
+      throw new Error("UsageForwarder: tenantContextJwt (Xâ€‘Tenantâ€‘Context) is required");
+    }
+
+    this.opts = {
+      flushIntervalMs: 5_000,
+      maxBatchSize: 20,
+      baseCorrelationId: `runtime-${Date.now()}`,
+      ...options,
+    };
+
+    this.http = axios.create({
+      timeout: 5_000,
+    });
+  }
+
+  /**
+   * Start periodic flushing.
+   */
+  start(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setInterval(() => {
+      this.flush().catch((err) => {
+        // Log but do not crash runtime
+        console.error("[UsageForwarder] flush error", err);
+      });
+    }, this.opts.flushIntervalMs);
+  }
+
+  /**
+   * Stop periodic flushing (does not autoâ€‘flush leftover events).
+   */
+  stop(): void {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+  }
+
+  /**
+   * Record a usage event into the local queue.
+   */
+  record(metric: string, quantity: number, properties?: Record<string, unknown>): void {
+    this.queue.push({ metric, quantity, properties });
+
+    // Optional: flush immediately if we hit batch size
+    if (this.queue.length >= this.opts.maxBatchSize) {
+      this.flush().catch((err) => {
+        console.error("[UsageForwarder] flush error (immediate)", err);
+      });
+    }
+  }
+
+  /**
+   * Flush queued events to the metering API.
+   *
+   * For simplicity, we POST one event per request to `/api/v1/usage-events`,
+   * matching the canonical ingestion contract. @59
+   */
+  async flush(): Promise<void> {
+    if (this.queue.length === 0) return;
+
+    // Take a snapshot of the current queue and clear it
+    const batch: RuntimeUsageEvent[] = this.queue.splice(0, this.queue.length);
+
+    for (const evt of batch) {
+      const body = this.buildUsagePayload(evt);
+
+      try {
+        const correlationId = this.buildCorrelationId();
+        await this.http.post(this.opts.endpoint, body, {
+          headers: {
+            "X-Tenant-Context": this.opts.tenantContextJwt,
+            "X-Correlation-Id": correlationId,
+            "Content-Type": "application/json",
+          },
+        });
+        // You could log success with event_id or correlationId if desired
+      } catch (err: any) {
+        // Basic error handling:
+        //  - log
+        //  - reâ€‘queue so it can be retried on next flush
+        console.error("[UsageForwarder] failed to POST usage event, reâ€‘queueing", {
+          error: err?.message ?? String(err),
+        });
+        this.queue.unshift(evt);
+
+        // OPTIONAL: If you want to handle 429 Retryâ€‘After specifically later:
+        // if (axios.isAxiosError(err) && err.response?.status === 429) {
+        //   const retryAfterHeader = err.response.headers["retry-after"];
+        //   // parse and delay flush, implement backoff/jitter, etc. @54
+        // }
+        break; // stop processing batch to avoid hammering endpoint
+      }
+    }
+  }
+
+  /**
+   * Build canonical payload aligning with usagepilot.v1 (minimal subset). @59 @95
+   */
+  private buildUsagePayload(evt: RuntimeUsageEvent): Record<string, unknown> {
+    return {
+      schema_version: "usagepilot.v1",
+      event_id: randomUUID(),
+      tenant_id: this.opts.tenantId,
+      metric: evt.metric,
+      quantity: evt.quantity,
+      primary_region: this.opts.primaryRegion,
+      timestamp: new Date().toISOString(),
+      payload: evt.properties ?? {},
+      // estimated_cost_usd, idempotency_key, event_hash, etc. can be added later
+    };
+  }
+
+  /**
+   * Derive a correlation id for each POST.
+   */
+  private buildCorrelationId(): string {
+    // Simple: baseCorrelationId + counter or UUID.
+    // For now, use UUID to avoid extra state.
+    return randomUUID();
+  }
+}
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
@@ -29363,24 +30515,61 @@ process.on('SIGTERM', async () => {
 
 ===== myKafkaPublisher.ts =====
 // src/services/myKafkaPublisher.ts
+import type { Request } from 'express';
+import type { Message } from 'kafkajs';
+import type { TenantClaims } from '../middleware/tenantContext.middleware';
+
 import { withTenantHeaders } from '../utils/tenantAwareKafkaProducer';
 import { Kafka } from 'kafkajs';
 
-export async function emitKafkaMessage(req) {
+/**
+ * Publishes a simple test event to Kafka, automatically injecting the
+ * Xâ€‘Tenantâ€‘Context and Xâ€‘Correlationâ€‘Id headers that were attached to the
+ * request by `tenantContextMiddleware`.
+ *
+ * @param req â€“ the incoming Express request (populated by the middleware)
+ */
+export async function emitKafkaMessage(req: Request): Promise<void> {
+  // -----------------------------------------------------------------
+  // Build the Kafka client â€“ the broker list is hardâ€‘coded for local dev.
+  // -----------------------------------------------------------------
   const kafka = new Kafka({ brokers: ['localhost:9092'] });
   const producer = kafka.producer();
 
-  const claims = req.tenantContext; // Populated by your middleware
+  // -----------------------------------------------------------------
+  // Grab the tenant claims that the middleware attached.
+  // -----------------------------------------------------------------
+  // `tenantContext` is added at runtime, so we cast the request to `any`
+  // before accessing it and then typeâ€‘assert the shape.
+  const claims = (req as any).tenantContext as TenantClaims | undefined;
+
+  // If for some reason the middleware didnâ€™t run, fail fast.
+  if (!claims) {
+    throw new Error('Tenant context not available on request');
+  }
+
+  // -----------------------------------------------------------------
+  // Prepare the payload and run it through the headerâ€‘injector.
+  // -----------------------------------------------------------------
   const payload = { event: 'something_happened' };
 
-  const message = withTenantHeaders(claims)({
-    value: Buffer.from(JSON.stringify(payload))
+  // `withTenantHeaders` returns a function that expects a `Message`
+  // and returns a `Message`.  We pass the minimal message (just a value)
+  // and let the wrapper add the required headers.
+  const message = (withTenantHeaders(claims) as (msg: Message) => Message)({
+    value: Buffer.from(JSON.stringify(payload)),
   });
 
+  // -----------------------------------------------------------------
+  // Send the message.  In a real service you would call `producer.connect()`
+  // once at startup; for a small utility itâ€™s fine to connect onâ€‘demand.
+  // -----------------------------------------------------------------
+  await producer.connect();
   await producer.send({
     topic: 'your.topic',
-    messages: [message]
+    messages: [message],
   });
+  await producer.disconnect();
 }
 
 
@@ -29388,15 +30577,185 @@ export async function emitKafkaMessage(req) {
 
 ===== myService.ts =====
 // src/services/myService.ts
+import type { Request } from 'express';
+import type { TenantClaims } from '../middleware/tenantContext.middleware';
 import { createTenantAwareHttpClient } from '../utils/tenantAwareHttpClient';
 
-export async function callPartnerApi(req) {
-  const getJwt = () => req.header('X-Tenant-Context') || '';
-  const getContext = () => req.tenantContext;
+/**
+ * Calls a downstream partner API while automatically injecting
+ * the tenant JWT (Xâ€‘Tenantâ€‘Context) and correlation ID via the
+ * tenantâ€‘aware Axios client.
+ *
+ * @param req â€“ the incoming Express request that already carries the
+ *              tenant context (populated by `tenantContextMiddleware`).
+ */
+export async function callPartnerApi(req: Request): Promise<void> {
+  // -----------------------------------------------------------------
+  // Helper functions that expose the JWT and the decoded tenant context
+  // -----------------------------------------------------------------
+  const getJwt = (): string => req.header('Xâ€‘Tenantâ€‘Context') ?? '';
+
+  // The middleware adds `tenantContext` to the request; we cast to `any`
+  // because the property isnâ€™t in the default Express Request type.
+  const getContext = (): TenantClaims | undefined =>
+    (req as any).tenantContext;
+
+  // -----------------------------------------------------------------
+  // Build a client that injects the required headers on every request
+  // -----------------------------------------------------------------
   const httpClient = createTenantAwareHttpClient(getJwt, getContext);
 
+  // -----------------------------------------------------------------
+  // Perform the outbound HTTP call
+  // -----------------------------------------------------------------
   await httpClient.post('https://example.com/endpoint', { key: 'val' });
 }
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\services
+
+===== SelectionService.js =====
+// src/services/SelectionService.js
+
+// Reuse your existing DB helper, same as DriverService.js
+const { Pool } = require('pg');
+
+// Create a connection pool to Postgres.
+// Uses DATABASE_URL if set, otherwise falls back to local dev DB.
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ||
+    'postgres://dev:devpass@localhost:5432/agentary',
+});
+
+/**
+ * A single table selection from the UI.
+ * Example shape:
+ * {
+ *   schema: "public",
+ *   table: "orders",
+ *   columns: ["id", "amount"]
+ * }
+ */
+function TableSelection(schema, table, columns) {
+  this.schema = schema;
+  this.table = table;
+  this.columns = columns;
+}
+
+/**
+ * Count unique tables and total fields and compare with plan limits.
+ * Enforces subscription quotas for selected tables and fields.
+ *
+ * @param {Object} selectionRequest
+ * @param {string} selectionRequest.driverId
+ * @param {Array<TableSelection>} selectionRequest.selections
+ * @param {Object} limits
+ * @param {number} limits.maxTables
+ * @param {number} limits.maxFields
+ * @returns {{ok: boolean, reason?: string, usedTables?: number, usedFields?: number, maxTables?: number, maxFields?: number}}
+ */
+function checkSelectionAgainstPlan(selectionRequest, limits) {
+  const tableKeys = new Set();
+  let fieldCount = 0;
+
+  for (const sel of selectionRequest.selections) {
+    const key = `${sel.schema}.${sel.table}`;
+    tableKeys.add(key);
+    fieldCount += (sel.columns || []).length;
+  }
+
+  const usedTables = tableKeys.size;
+  const usedFields = fieldCount;
+
+  if (usedTables > limits.maxTables) {
+    return {
+      ok: false,
+      reason: 'TABLE_LIMIT',
+      usedTables,
+      usedFields,
+      maxTables: limits.maxTables,
+      maxFields: limits.maxFields,
+    };
+  }
+
+  if (usedFields > limits.maxFields) {
+    return {
+      ok: false,
+      reason: 'FIELD_LIMIT',
+      usedTables,
+      usedFields,
+      maxTables: limits.maxTables,
+      maxFields: limits.maxFields,
+    };
+  }
+
+  return {
+    ok: true,
+    usedTables,
+    usedFields,
+    maxTables: limits.maxTables,
+    maxFields: limits.maxFields,
+  };
+}
+
+/**
+ * For now, return hardâ€‘coded plan limits based on subscription tier.
+ * Later, replace this with a real lookup from subscriptions/billing.
+ */
+async function getPlanLimitsForTenant(tenantId, driverId) {
+  // TODO: read from subscription system; for now use Pro-like defaults
+  return {
+    maxTables: 15,
+    maxFields: 150,
+  };
+}
+
+/**
+ * Save or update the tenant's table/field selection for a driver.
+ *
+ * Writes into your existing table:
+ *   tenant_driver_selections (tenant_id, driver_id, selected_by, selected_tables)
+ */
+async function saveSelection(tenantId, selectedBy, selectionRequest) {
+  const selectedTables = selectionRequest.selections.map((s) => ({
+    schema: s.schema,
+    table: s.table,
+    columns: s.columns || [],
+  }));
+
+  // NOTE: using ON CONFLICT on (tenant_id, driver_id) as defined in your DDL
+  const sql = `
+    INSERT INTO tenant_driver_selections (
+      tenant_id,
+      driver_id,
+      selected_by,
+      selected_tables
+    )
+    VALUES ($1, $2, $3, $4::jsonb)
+    ON CONFLICT (tenant_id, driver_id)
+    DO UPDATE SET
+      selected_by      = EXCLUDED.selected_by,
+      selected_tables  = EXCLUDED.selected_tables,
+      created_at       = NOW()
+  `;
+
+  const params = [
+    tenantId,
+    selectionRequest.driverId,
+    selectedBy,
+    JSON.stringify(selectedTables),
+  ];
+
+await pool.query(sql, params);
+
+}
+
+module.exports = {
+  checkSelectionAgainstPlan,
+  getPlanLimitsForTenant,
+  saveSelection,
+};
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\utils
@@ -29567,23 +30926,28 @@ export function validateUsagePilotEvent(event: any): boolean {
 ===== producer.integration.test.js =====
 const { connectProducer, publishUsageEvent } = require('../src/index');
 
-async function runTest() {
-  await connectProducer();
-  await publishUsageEvent({
-    servicetype: 'nlp',
-    tenantid: 'tenant-42',
-    value: { metric: 'UDFCALL', count: 1 },
-    XTenantContext: 'test-context',
-    XCorrelationId: 'test-corr',
-    idempotencykey: 'idem-unique',
-    eventhash: 'etag-hash',
-    regiontag: 'us-west-1'
-  });
-  console.log('Message published successfully!');
-  process.exit(0);
-}
+// Skips the test if you don't have Kafka running locally.
+// To run it, remove ".skip" and start a Kafka broker on localhost:9092.
+test.skip(
+  "producer integration test - publishes usage event to Kafka",
+  async () => {
+    // This wrapper lets Jest control execution and report errors properly
+    await connectProducer();
 
-runTest();
+    await publishUsageEvent({
+      servicetype: 'nlp',
+      tenantid: 'tenant-42',
+      value: { metric: 'UDFCALL', count: 1 },
+      XTenantContext: 'test-context',
+      XCorrelationId: 'test-corr',
+      idempotencykey: 'idem-unique',
+      eventhash: 'etag-hash',
+      regiontag: 'us-west-1',
+    });
+
+    console.log('Message published successfully!');
+  }
+);
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\tests
@@ -29876,6 +31240,8 @@ describe('orchestrator deployment labels', () => {
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\tests\services\catalog\jobs
 
 ===== signArtifactsJob.integration.test.js =====
+test.todo("implement signArtifactsJob integration test");
+
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\tests\services\catalog\lib
 
