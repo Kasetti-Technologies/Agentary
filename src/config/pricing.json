@@ -1,20 +1,20 @@
-{
-  "NLP_UDF_CALL_V1": {
-    "service_type": "NLP",
-    "unit": "udf_call",
-    "unit_price": 0.0023,
-    "currency": "USD"
-  },
-  "AGENTIC_EMAIL_V1": {
-    "service_type": "AGENTIC_AI",
-    "unit": "email",
-    "unit_price": 0.0080,
-    "currency": "USD"
-  },
-  "SUMMARIZER_PAGE_V1": {
-    "service_type": "SUMMARIZER",
-    "unit": "page",
-    "unit_price": 0.0100,
-    "currency": "USD"
-  }
-}
+   {
+     "NLP_UDF_CALL_V1": {
+       "service_type": "NLP",
+       "unit": "call",
+       "unit_price": 0.004,
+       "currency": "USD"
+     },
+     "AGENTIC_EMAIL_V1": {
+       "service_type": "AGENTIC_AI",
+       "unit": "email",
+       "unit_price": 0.008,
+       "currency": "USD"
+     },
+     "SUMMARIZER_PAGE_V1": {
+       "service_type": "SUMMARIZER",
+       "unit": "page",
+       "unit_price": 0.002,
+       "currency": "USD"
+     }
+   }

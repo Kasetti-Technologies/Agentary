@@ -42,6 +42,11 @@ export class BillingAggregator {
           if (!message.value) return;
 
           const raw = message.value.toString('utf8');
+          console.log(
+  `[BillingAggregator] Received message on ${topic}, raw=`,
+  raw
+);
+
           const event = JSON.parse(raw);
 
           // Adjust these field names to match your usage-event schema:
@@ -109,7 +114,7 @@ export class BillingAggregator {
         tenant_id,
         service_type,
         usage_event_id,
-        usage_hash,
+        usage_event_hash,
         price_id,
         price_at_purchase,
         quantity,
@@ -134,6 +139,12 @@ export class BillingAggregator {
       params.windowStart.toISOString(),
       params.windowEnd.toISOString(),
     ];
+try {
+  await this.pool.query(sql, values);
+} catch (err) {
+  console.error('[BillingAggregator] DB insert failed', err);
+  throw err;
+}
 
     await this.pool.query(sql, values);
   }
