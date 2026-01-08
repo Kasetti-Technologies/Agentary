@@ -36,6 +36,7 @@ CREDENTIAL_ROTATION_RETRY_SECONDS=10
 
 # HTTP port for the runtime
 PORT=3000
+KAFKAJS_NO_PARTITIONER_WARNING=1
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary
@@ -136,13 +137,18 @@ components:
   "directories": {
     "doc": "docs"
   },
-  "scripts": {
-    "test": "jest --detectOpenHandles",
-    "test:watch": "jest --watch",
-    "seed": "node ci/scripts/seed-testdata.js",
-    "build": "tsc --project tsconfig.json",
-    "watch": "tsc --project tsconfig.json --watch"
-  },
+"scripts": {
+  "billing:dev": "ts-node src/billing-aggregator-main.ts",
+  "billing:invoice": "ts-node src/billing-invoice-main.ts",
+  "api:dev": "ts-node src/server.ts",
+  "api:start": "node dist/server.js",
+  "test": "jest --detectOpenHandles",
+  "test:watch": "jest --watch",
+  "seed": "node ci/scripts/seed-testdata.js",
+  "build": "tsc --project tsconfig.json",
+  "watch": "tsc --project tsconfig.json --watch"
+},
+
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kasetti-Technologies/Agentary.git"
@@ -27472,6 +27478,43 @@ seed();
 ]
  
 
+### Folder: C:\Users\Admin\Documents\Github\Agentary\dev
+
+===== send-test-usage.js =====
+   const { Kafka } = require('kafkajs');
+
+   (async () => {
+     const kafka = new Kafka({
+       clientId: 'test-producer',
+       brokers: ['localhost:9092'],
+     });
+
+     const producer = kafka.producer();
+     await producer.connect();
+
+     const event = {
+       id: 'evt_123',
+       tenant_id: 'tenant-123',
+       service_type: 'NLP',
+       event_type: 'UDF_CALL',
+       timestamp: new Date().toISOString(),
+       event_hash: 'hash_evt_123',
+       quantity: 1,
+     };
+
+     await producer.send({
+       topic: 'usage.nlp',
+       messages: [{ value: JSON.stringify(event) }],
+     });
+
+     await producer.disconnect();
+     console.log('Sent test usage event');
+   })().catch((err) => {
+     console.error('Producer error', err);
+     process.exit(1);
+   });
+
+
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\docs
 
 ===== db_migration_policy.md =====
@@ -28226,53 +28269,169 @@ module.exports = new KafkaProducer();
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src
 
 ===== app.ts =====
-import express from 'express';
-import type { Request, Response, NextFunction } from 'express';
+// src/app.ts
+import express, {
+  type Request,
+  type Response,
+  type NextFunction,
+  type ErrorRequestHandler,
+} from 'express';
+
 import {
   tenantContextMiddleware,
   releaseDbClientMiddleware,
 } from './middleware/tenantContext.middleware';
 import { usageEventsRouter } from './routes/usageEvents.router';
+import { billingSubscriptionsRouter } from './routes/billingSubscriptions.router';
 
 const app = express();
+app.get('/health', (_req, res) => { res.status(200).json({ ok: true }); });
+// JSON body parser
+app.use(express.json());
 
-app.use(express.json());               // JSON body parser
-app.use(tenantContextMiddleware);      //  Critical Setup Middleware
-app.use('/api/v1/usage-events', usageEventsRouter); //  Routes
-app.use(releaseDbClientMiddleware);   //  Cleanup Middleware
+// Critical Setup Middleware (attaches tenantContext + dbClient)
+app.use(tenantContextMiddleware);
 
-//  Centralized Error Handler (typed)
-app.use(
-  (
-    err: unknown,
-    req: Request,
-    res: Response,
-    next: NextFunction
-  ) => {
-    console.error(err);
+// Routes
+app.use('/api/v1/usage-events', usageEventsRouter);
+app.use('/api/v1/billing/subscriptions', billingSubscriptionsRouter);
 
-    if (
-      typeof err === 'object' &&
-      err !== null &&
-      'message' in err &&
-      (err as any).message.includes('UsageEvent schema validation failed')
-    ) {
-      const message = (err as any).message as string;
-      return res.status(422).json({
-        code: 'VALIDATION_ERROR',
-        message: 'Request body does not conform to usagepilot.v1 schema.',
-        details: JSON.parse(message.split(': ')[1]),
-      });
-    }
+// Cleanup Middleware (releases dbClient after response)
+app.use(releaseDbClientMiddleware);
 
-    res.status(500).json({
-      code: 'INTERNAL_SERVER_ERROR',
-      message: 'An unexpected error occurred.',
+// Centralized Error Handler (typed)
+const errorHandler: ErrorRequestHandler = (
+  err,
+  req,
+  res,
+  next,
+) => {
+  console.error(err);
+
+  if (
+    typeof err === 'object' &&
+    err !== null &&
+    'message' in err &&
+    (err as any).message.includes('UsageEvent schema validation failed')
+  ) {
+    const message = (err as any).message as string;
+
+    return res.status(422).json({
+      code: 'VALIDATION_ERROR',
+      message:
+        'Request body does not conform to usagepilot.v1 schema.',
+      details: JSON.parse(message.split(': ')[1]),
     });
   }
-);
+
+  return res.status(500).json({
+    code: 'INTERNAL_SERVER_ERROR',
+    message: 'An unexpected error occurred.',
+  });
+};
+
+app.use(errorHandler);
 
 export default app;
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src
+
+===== billing-aggregator-main.ts =====
+// src/billing-aggregator-main.ts
+import { createPgPool } from './runtime/pgPool';
+import { PricingService } from './runtime/PricingService';
+import { BillingAggregator } from './runtime/BillingAggregator';
+
+async function main() {
+  const pool = createPgPool();
+  const pricing = new PricingService();
+
+  const brokers = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
+
+  const aggregator = new BillingAggregator(pool, pricing, {
+    kafkaBrokers: brokers,
+    groupId: 'billing-aggregator-v1',
+    topics: [
+      'usage.nlp',        // adapt to your actual topic names
+      'usage.agentic',
+      'usage.summarizer',
+    ],
+  });
+
+  await aggregator.start();
+}
+
+main().catch((err) => {
+  console.error('[billing-aggregator-main] Fatal error', err);
+  process.exit(1);
+});
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src
+
+===== billing-invoice-main.ts =====
+// src/billing-invoice-main.ts
+import { getDbPool } from './db';
+import { InvoiceGenerator } from './billing/invoiceGenerator';
+
+async function main() {
+  const pool = getDbPool();
+  const generator = new InvoiceGenerator(pool);
+
+  // For now, read billing period from environment or CLI args.
+  // Example: BILLING_PERIOD_START=2025-01-01 BILLING_PERIOD_END=2025-01-31
+  const startEnv = process.env.BILLING_PERIOD_START;
+  const endEnv = process.env.BILLING_PERIOD_END;
+
+  if (!startEnv || !endEnv) {
+    console.error('BILLING_PERIOD_START and BILLING_PERIOD_END env vars are required');
+    process.exit(1);
+  }
+
+  const billingPeriodStart = new Date(startEnv);
+  const billingPeriodEnd = new Date(endEnv);
+
+  console.log(
+    `Generating invoices for period ${billingPeriodStart.toISOString()} to ${billingPeriodEnd.toISOString()}`
+  );
+
+  try {
+    const invoices = await generator.generateInvoicesForPeriod(
+      billingPeriodStart,
+      billingPeriodEnd,
+      process.env.INVOICE_CURRENCY || 'USD'
+    );
+
+    console.log(`Generated ${invoices.length} invoices`);
+    for (const inv of invoices) {
+      console.log(
+        `Invoice ${inv.invoiceId} tenant=${inv.tenantId} total=${inv.totalAmountCents} cents`
+      );
+    }
+    process.exit(0);
+  } catch (err) {
+    console.error('Invoice generation failed:', err);
+    process.exit(1);
+  }
+}
+
+main();
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src
+
+===== db.ts =====
+// src/db.ts
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASEURL, // from .env @1
+});
+
+export function getDbPool(): Pool {
+  return pool;
+}
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src
@@ -28545,6 +28704,539 @@ module.exports = {
 };
 
 
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src
+
+===== server.ts =====
+   // src/server.ts
+   import 'dotenv/config';
+   import app from './app';
+
+   const port = process.env.PORT || 4000;
+
+   app.listen(port, () => {
+     console.log(`[Agentary] API listening on port ${port}`);
+   });
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== archivalEvidence.ts =====
+// src/billing/archivalEvidence.ts
+import { BillingEvent } from './domain/invoice';
+
+// TODO: replace this with actual S3 upload using @aws-sdk/client-s3 if desired.
+export async function createArchivalEvidenceBundle(
+  invoiceId: string,
+  events: BillingEvent[]
+): Promise<{
+  archivalEvidenceUri: string;
+  eventHashes: string[];
+}> {
+  const eventHashes = events.map((ev) => ev.eventHash);
+
+  // For now, just pretend we've created an archive and uploaded it.
+  // Example URI pattern; adjust for your environment.
+  const archivalEvidenceUri = `s3://agentary-archives/invoices/${invoiceId}/evidence.json`;
+
+  // In a full implementation, you would:
+  // 1. Serialize { invoiceId, eventHashes, createdAt } as JSON
+  // 2. Upload to S3 and return the real S3 URI
+
+  return { archivalEvidenceUri, eventHashes };
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== invoiceGenerator.ts =====
+// src/billing/invoiceGenerator.ts
+import { Pool } from 'pg';
+import { Invoice } from './domain/invoice';
+import { InvoiceRepository } from './invoiceRepository';
+import { createArchivalEvidenceBundle } from './archivalEvidence';
+
+export class InvoiceGenerator {
+  private readonly repo: InvoiceRepository;
+
+  constructor(pool: Pool) {
+    this.repo = new InvoiceRepository(pool);
+  }
+
+  /**
+   * Generate invoices for a given billing period.
+   * billingPeriodStart/billingPeriodEnd should match your billing_cycles table.
+   */
+  async generateInvoicesForPeriod(
+    billingPeriodStart: Date,
+    billingPeriodEnd: Date,
+    defaultCurrency = 'USD'
+  ): Promise<Invoice[]> {
+    const results: Invoice[] = [];
+
+    const eventsByTenant = await this.repo.getUninvoicedBillingEvents(
+      billingPeriodStart,
+      billingPeriodEnd
+    );
+
+    for (const [tenantId, events] of eventsByTenant.entries()) {
+      if (events.length === 0) continue;
+
+      // 1. Create archival evidence bundle (list of event_hashes + S3 ref)
+      const { archivalEvidenceUri } = await createArchivalEvidenceBundle(
+        /* invoiceId placeholder; real ID is created in repo */ `pending-${tenantId}`,
+        events
+      );
+
+      // 2. Create the invoice and line items (repo will generate invoice_id)
+      const invoice = await this.repo.createInvoiceWithLines(
+        tenantId,
+        billingPeriodStart,
+        billingPeriodEnd,
+        events,
+        defaultCurrency,
+        archivalEvidenceUri
+      );
+
+      results.push(invoice);
+    }
+
+    return results;
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== invoiceRepository.ts =====
+// src/billing/invoiceRepository.ts
+import { randomUUID } from 'crypto';
+import { Pool, PoolClient } from 'pg';
+import { BillingEvent, Invoice, InvoiceLineItem } from './domain/invoice';
+
+export class InvoiceRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async getUninvoicedBillingEvents(
+    billingPeriodStart: Date,
+    billingPeriodEnd: Date
+  ): Promise<Map<string, BillingEvent[]>> {
+    const sql = `
+      SELECT
+        id,
+        tenant_id,
+        billing_period_start,
+        billing_period_end,
+        price_id,
+        quantity,
+        amount_cents,
+        event_hash
+      FROM billing_events
+      WHERE invoice_id IS NULL
+        AND billing_period_start >= $1
+        AND billing_period_end   <= $2
+    `;
+    const res = await this.pool.query(sql, [billingPeriodStart, billingPeriodEnd]);
+
+    const byTenant = new Map<string, BillingEvent[]>();
+
+    for (const row of res.rows) {
+      const event: BillingEvent = {
+        id: row.id,
+        tenantId: row.tenant_id,
+        billingPeriodStart: row.billing_period_start,
+        billingPeriodEnd: row.billing_period_end,
+        priceId: row.price_id,
+        quantity: Number(row.quantity),
+        amountCents: Number(row.amount_cents),
+        eventHash: row.event_hash,
+      };
+
+      const list = byTenant.get(event.tenantId) ?? [];
+      list.push(event);
+      byTenant.set(event.tenantId, list);
+    }
+
+    return byTenant;
+  }
+
+  async createInvoiceWithLines(
+    tenantId: string,
+    periodStart: Date,
+    periodEnd: Date,
+    events: BillingEvent[],
+    currency: string,
+    archivalEvidenceUri: string | null
+  ): Promise<Invoice> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const invoiceId = randomUUID();
+
+      const totalAmountCents = events.reduce(
+        (sum, ev) => sum + ev.amountCents,
+        0
+      );
+
+      const insertInvoiceSql = `
+        INSERT INTO invoices (
+          invoice_id,
+          tenant_id,
+          billing_period_start,
+          billing_period_end,
+          currency,
+          total_amount_cents,
+          status,
+          archival_evidence_uri
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7)
+        RETURNING created_at
+      `;
+
+      const invoiceRes = await client.query(insertInvoiceSql, [
+        invoiceId,
+        tenantId,
+        periodStart,
+        periodEnd,
+        currency,
+        totalAmountCents,
+        archivalEvidenceUri,
+      ]);
+
+      const createdAt: Date = invoiceRes.rows[0].created_at;
+
+      const insertLineSql = `
+        INSERT INTO invoice_line_items (
+          invoice_line_item_id,
+          invoice_id,
+          billing_event_id,
+          price_id,
+          quantity,
+          amount_cents,
+          description
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `;
+
+      for (const ev of events) {
+        const lineItemId = randomUUID();
+        const description = `Billing event ${ev.id} (price_id=${ev.priceId})`;
+        await client.query(insertLineSql, [
+          lineItemId,
+          invoiceId,
+          ev.id,
+          ev.priceId,
+          ev.quantity,
+          ev.amountCents,
+          description,
+        ]);
+      }
+
+      const updateEventsSql = `
+        UPDATE billing_events
+        SET invoice_id = $1
+        WHERE id = ANY($2::uuid[])
+      `;
+      const eventIds = events.map((ev) => ev.id);
+      await client.query(updateEventsSql, [invoiceId, eventIds]);
+
+      await client.query('COMMIT');
+
+      return {
+        invoiceId,
+        tenantId,
+        billingPeriodStart: periodStart,
+        billingPeriodEnd: periodEnd,
+        currency,
+        totalAmountCents,
+        status: 'draft',
+        archivalEvidenceUri: archivalEvidenceUri ?? undefined,
+        createdAt,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== slaIntegration.ts =====
+// src/billing/slaIntegration.ts
+
+import {
+  SlaCalculator,
+  SlaIncident,
+  SlaPolicy,
+  SlaCreditLine,
+} from '../sla/slaCalculator';
+
+/**
+ * Shape of a credit line that billing / invoice code can use.
+ * This is close to invoice_lines: description + amount_cents + sla_incident_id.
+ */
+export interface InvoiceCreditLineInput {
+  description: string;
+  amountCents: number;   // negative
+  slaIncidentId: string;
+}
+
+export class SlaIntegrationService {
+  private readonly calculator: SlaCalculator;
+
+  constructor() {
+    this.calculator = new SlaCalculator();
+  }
+
+  /**
+   * For now, we accept incidents and policies as parameters.
+   * Later, invoice generation can:
+   *  - Load incidents from DB for this tenant and billing period
+   *  - Load SLA policies from DB
+   *  - Call this method to get credit lines
+   */
+  public calculateCreditsForInvoice(
+    incidents: SlaIncident[],
+    policies: SlaPolicy[],
+  ): InvoiceCreditLineInput[] {
+    const creditLines: SlaCreditLine[] =
+      this.calculator.calculateCredits(incidents, policies);
+
+    return creditLines.map((c) => ({
+      description: c.description,
+      amountCents: c.amountCents,
+      slaIncidentId: c.slaIncidentId,
+    }));
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== subscriptionRoutes.ts =====
+// src/billing/subscriptionRoutes.ts
+
+import { Router, Request, Response, NextFunction } from 'express';
+import {
+  createSubscriptionWithPriceSnapshot,
+  CreateSubscriptionRequest,
+} from './subscriptionService';
+
+export const subscriptionRouter = Router();
+
+subscriptionRouter.post(
+  '/subscriptions',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const tenantContext = (req as any).tenantContext;
+      if (!tenantContext || !tenantContext.sub) {
+        return res.status(401).json({
+          error: 'UNAUTHORIZED',
+          message: 'Missing or invalid TenantContext',
+        });
+      }
+
+      const tenantId = tenantContext.sub as string;
+      const { serviceType, driverId, quantity, startsAt } = req.body ?? {};
+
+      if (!serviceType || typeof serviceType !== 'string') {
+        return res.status(400).json({
+          error: 'VALIDATION_ERROR',
+          message: 'serviceType is required and must be a string',
+        });
+      }
+
+      const qtyNumber = Number(quantity);
+      if (!Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+        return res.status(400).json({
+          error: 'VALIDATION_ERROR',
+          message: 'quantity is required and must be a positive number',
+        });
+      }
+
+      let startsAtDate: Date | undefined;
+      if (startsAt) {
+        const parsed = new Date(startsAt);
+        if (isNaN(parsed.getTime())) {
+          return res.status(400).json({
+            error: 'VALIDATION_ERROR',
+            message: 'startsAt must be a valid ISO date string if provided',
+          });
+        }
+        startsAtDate = parsed;
+      }
+
+      const input: CreateSubscriptionRequest = {
+        tenantId,
+        serviceType,
+        driverId,
+        quantity: qtyNumber,
+        startsAt: startsAtDate,
+      };
+
+      const subscription = await createSubscriptionWithPriceSnapshot(input);
+
+      return res.status(201).json(subscription);
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing
+
+===== subscriptionService.ts =====
+// src/billing/subscriptionService.ts
+
+import { pricingEngine } from '../pricing/pricingEngineInstance';
+
+export interface Subscription {
+  id: string;
+  tenantId: string;
+  serviceType: string;
+  driverId?: string | null;
+  quantity: number;
+  priceId: string;
+  unitPriceCents: number;
+  currency: string;
+  startsAt: Date;
+  createdAt: Date;
+}
+
+// Whatever you actually persist to DB
+export interface CreateSubscriptionInput {
+  tenantId: string;
+  serviceType: string;
+  driverId?: string | null;
+  quantity: number;
+  priceId: string;
+  unitPriceCents: number;
+  currency: string;
+  startsAt: Date;
+}
+
+export interface CreateSubscriptionRequest {
+  tenantId: string;      // from TenantContext
+  serviceType: string;   // e.g. "NLP"
+  driverId?: string;
+  quantity: number;
+  startsAt?: Date;
+}
+
+// TODO: replace with your real DB insert logic
+async function createSubscription(
+  input: CreateSubscriptionInput,
+): Promise<Subscription> {
+  // placeholder: implement with pg or your repo layer
+  throw new Error('createSubscription() not implemented');
+}
+
+function mapServiceTypeToMetric(serviceType: string): string {
+  // Adjust to match your pricing.base_prices.metric values
+  return `subscription.${serviceType.toLowerCase()}`;
+}
+
+export async function createSubscriptionWithPriceSnapshot(
+  req: CreateSubscriptionRequest,
+): Promise<Subscription> {
+  const { tenantId, serviceType, driverId, quantity, startsAt } = req;
+
+  const metric = mapServiceTypeToMetric(serviceType);
+  const effectiveTimestamp = startsAt ?? new Date();
+
+  const resolved = await pricingEngine.resolvePrice({
+    tenantId,
+    metric,
+    quantity,
+    timestamp: effectiveTimestamp,
+  });
+
+  const createInput: CreateSubscriptionInput = {
+    tenantId,
+    serviceType,
+    driverId: driverId ?? null,
+    quantity,
+    priceId: resolved.priceId,
+    unitPriceCents: resolved.unitPriceCents,
+    currency: resolved.currency,
+    startsAt: effectiveTimestamp,
+  };
+
+  const subscription = await createSubscription(createInput);
+  return subscription;
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\billing\domain
+
+===== invoice.ts =====
+// src/billing/domain/invoice.ts
+
+export interface Invoice {
+  invoiceId: string;
+  tenantId: string;
+  billingPeriodStart: Date;
+  billingPeriodEnd: Date;
+  currency: string;
+  totalAmountCents: number;
+  status: 'draft' | 'issued' | 'paid' | 'voided';
+  archivalEvidenceUri?: string;
+  createdAt: Date;
+}
+
+export interface InvoiceLineItem {
+  invoiceLineItemId: string;
+  invoiceId: string;
+  billingEventId: string;
+  priceId: string;
+  quantity: number;
+  amountCents: number;
+  description?: string;
+  createdAt: Date;
+}
+
+export interface BillingEvent {
+  id: string;              // billing_events.id
+  tenantId: string;
+  billingPeriodStart: Date;
+  billingPeriodEnd: Date;
+  priceId: string;         // immutable price_id at purchase
+  quantity: number;
+  amountCents: number;
+  eventHash: string;       // used for archival evidence bundle
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\config
+
+===== pricing.json =====
+   {
+     "NLP_UDF_CALL_V1": {
+       "service_type": "NLP",
+       "unit": "call",
+       "unit_price": 0.004,
+       "currency": "USD"
+     },
+     "AGENTIC_EMAIL_V1": {
+       "service_type": "AGENTIC_AI",
+       "unit": "email",
+       "unit_price": 0.008,
+       "currency": "USD"
+     },
+     "SUMMARIZER_PAGE_V1": {
+       "service_type": "SUMMARIZER",
+       "unit": "page",
+       "unit_price": 0.002,
+       "currency": "USD"
+     }
+   }
+
+
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\controllers
 
 ===== artifactPublicKey.controller.ts =====
@@ -28577,6 +29269,140 @@ export async function getArtifactPublicKey(req: Request, res: Response) {
   };
 
   return res.status(200).json(payload);
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\controllers
+
+===== billingSubscriptions.controller.ts =====
+// src/controllers/billingSubscriptions.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { PoolClient } from 'pg';
+import { pricingEngine } from '../pricing/pricingEngineInstance';
+
+function mapServiceTypeToMetric(serviceType: string): string {
+  // Adjust this mapping to match pricing.base_prices.metric values
+  // Example: "NLP" -> "subscription.nlp"
+  return `subscription.${serviceType.toLowerCase()}`;
+}
+
+export async function createSubscriptionHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const anyReq = req as any;
+
+    // Ensure middleware attached tenantContext + dbClient
+    if (!anyReq.tenantContext || !anyReq.dbClient) {
+      throw new Error('Tenant context or DB client not available on request.');
+    }
+
+    const tenantContext = anyReq.tenantContext;
+    const dbClient: PoolClient = anyReq.dbClient;
+
+    const tenantId: string = tenantContext.sub;
+
+    const { serviceType, driverId, quantity, startsAt } = req.body ?? {};
+
+    // Basic validation
+    if (!serviceType || typeof serviceType !== 'string') {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        message: 'serviceType is required and must be a string.',
+      });
+      return;
+    }
+
+    const qtyNumber = Number(quantity);
+    if (!Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({
+        code: 'VALIDATION_ERROR',
+        message: 'quantity is required and must be a positive number.',
+      });
+      return;
+    }
+
+    let startsAtDate: Date;
+    if (startsAt) {
+      const parsed = new Date(startsAt);
+      if (isNaN(parsed.getTime())) {
+        res.status(400).json({
+          code: 'VALIDATION_ERROR',
+          message: 'startsAt must be a valid ISO date string if provided.',
+        });
+        return;
+      }
+      startsAtDate = parsed;
+    } else {
+      startsAtDate = new Date();
+    }
+
+    const metric = mapServiceTypeToMetric(serviceType);
+
+    // Resolve price via PricingEngine (override â†’ promo â†’ volume â†’ base)
+    const resolved = await pricingEngine.resolvePrice({
+      tenantId,
+      metric,
+      quantity: qtyNumber,
+      timestamp: startsAtDate,
+    });
+
+    // Insert subscription row with price snapshot
+    const insertSql = `
+      INSERT INTO billing.subscriptions (
+        tenant_id,
+        service_type,
+        driver_id,
+        quantity,
+        price_id,
+        unit_price_cents,
+        currency,
+        starts_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING
+        subscription_id,
+        tenant_id,
+        service_type,
+        driver_id,
+        quantity,
+        price_id,
+        unit_price_cents,
+        currency,
+        starts_at,
+        created_at;
+    `;
+
+    const result = await dbClient.query(insertSql, [
+      tenantId,
+      serviceType,
+      driverId ?? null,
+      qtyNumber,
+      resolved.priceId,
+      resolved.unitPriceCents,
+      resolved.currency,
+      startsAtDate,
+    ]);
+
+    const row = result.rows[0];
+
+    res.status(201).json({
+      subscription_id: row.subscription_id,
+      tenant_id: row.tenant_id,
+      service_type: row.service_type,
+      driver_id: row.driver_id,
+      quantity: row.quantity,
+      price_id: row.price_id,
+      unit_price_cents: row.unit_price_cents,
+      currency: row.currency,
+      starts_at: row.starts_at,
+      created_at: row.created_at,
+    });
+  } catch (err) {
+    next(err);
+  }
 }
 
 
@@ -29192,6 +30018,27 @@ export function releaseDbClientMiddleware(req: Request, res: Response, next: Nex
     }
   });
   next();
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\models
+
+===== subscription.ts =====
+export type SubscriptionStatus = 'active' | 'canceled' | 'trial';
+
+export interface Subscription {
+  subscription_id: string;
+  tenant_id: string;
+  service_type: string;      // e.g. "NLP", "AGENTIC_AI"
+  driver_id: string | null;
+  status: SubscriptionStatus;
+  quantity: number;
+  price_id: string;          // immutable pricing handle (snapshot at purchase)
+  unit_price_cents: number;  // price per unit at purchase
+  currency: string;          // e.g. "USD"
+  starts_at: Date;
+  ends_at: Date | null;
+  created_at: Date;
 }
 
 
@@ -29889,6 +30736,418 @@ export async function computeSha256(filePath: string): Promise<string> {
 }
 
 
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\pricing
+
+===== manualPriceTest.ts =====
+// src/pricing/manualPriceTest.ts
+
+import { Pool } from 'pg';
+import { PricingEngine } from './PricingEngine'; // adjust path if needed
+
+async function main(): Promise<void> {
+  // 1) Create Postgres connection pool (matches your local dev setup)
+  const connectionString: string =
+    process.env.DATABASE_URL ?? 'postgres://dev:devpass@localhost:5432/agentary';
+
+  const pool = new Pool({ connectionString });
+
+  // 2) Instantiate PricingEngine with the pool
+  const engine = new PricingEngine(pool);
+
+  // 3) Define test input
+  // Use a tenant_id that you seeded overrides/promos for; if you used a specific UUID,
+  // replace this with that value.
+  const tenantId = '00000000-0000-0000-0000-000000000001'; // TODO: replace if needed
+  const metric = 'nlp.udf_call';
+  const quantity = 100; // e.g., 100 UDF calls
+  const effectiveAt = new Date(); // now
+
+  try {
+    // 4) Resolve price using the engine
+    // IMPORTANT: resolvePrice expects ONE argument (an object), not 4 separate args.
+    const result = await engine.resolvePrice({
+      tenantId,
+      metric,
+      quantity,
+      effectiveAt,
+    } as any); // 'as any' to bypass TS mismatch if your type names differ slightly
+
+    // 5) Prettyâ€‘print the result
+    console.log('=== PricingEngine manual test ===');
+    console.log(`Tenant ID   : ${tenantId}`);
+    console.log(`Metric      : ${metric}`);
+    console.log(`Quantity    : ${quantity}`);
+    console.log(`Effective At: ${effectiveAt.toISOString()}`);
+    console.log('--- Raw resolved price result ---');
+    console.log(JSON.stringify(result, null, 2));
+
+    // Optional: humanâ€‘readable summary if these fields exist
+    if (
+      (result as any).unitPriceCents !== undefined &&
+      (result as any).amountCents !== undefined &&
+      (result as any).priceId
+    ) {
+      const unit = (result as any).unitPriceCents as number;
+      const amount = (result as any).amountCents as number;
+      const priceId = (result as any).priceId as string;
+      const source = ((result as any).source as string) || 'unknown';
+
+      console.log('');
+      console.log(
+        `Price ID    : ${priceId} (source: ${source}, e.g. override/promo/volume/base)`
+      );
+      console.log(`Unit price  : ${(unit / 100).toFixed(4)} USD`);
+      console.log(`Total amount: ${(amount / 100).toFixed(4)} USD`);
+    }
+  } catch (err) {
+    console.error('PricingEngine manual test FAILED:', err);
+  } finally {
+    // 6) Cleanup
+    await pool.end();
+  }
+}
+
+// Run if called directly (ts-node)
+main().catch((err) => {
+  console.error('Fatal error in manualPriceTest:', err);
+  process.exit(1);
+});
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\pricing
+
+===== PricingEngine.ts =====
+// src/pricing/PricingEngine.ts
+
+import { Pool } from 'pg';
+
+export type DerivedFrom = 'BASE' | 'VOLUME' | 'PROMOTION' | 'OVERRIDE';
+
+export interface ResolvePriceInput {
+  tenantId: string;
+  metric: string;             // e.g. 'nlp.udf_call'
+  quantity: number;           // usage quantity
+  timestamp?: Date;           // when the usage is effective
+  bundleId?: string | null;   // reserved for sharedâ€‘quota/bundles later
+}
+
+export interface ResolvePriceResult {
+  priceId: string;            // immutable price_id snapshot
+  unitPriceCents: number;     // integer cents
+  unitPriceUsd: number;
+  currency: string;
+  derivedFrom: DerivedFrom;
+}
+
+/**
+ * PricingEngine:
+ * - Reads from pricing.base_prices, pricing.volume_discounts,
+ *   pricing.promotions, pricing.overrides.
+ * - Precedence: override â†’ promotion â†’ volume discount â†’ base.
+ */
+export class PricingEngine {
+  private pool: Pool;
+
+  constructor(pool: Pool) {
+    this.pool = pool;
+  }
+
+  /**
+   * Resolve the unit price for a given tenant / metric / quantity / timestamp.
+   */
+  async resolvePrice(input: ResolvePriceInput): Promise<ResolvePriceResult> {
+    const ts = input.timestamp ?? new Date();
+
+    // 1) Base price (required)
+    const base = await this.loadBasePrice(input.metric, ts);
+    if (!base) {
+      throw new Error(`No base price configured for metric=${input.metric}`);
+    }
+
+    let unitPriceCents = Number(base.unit_price_cents);
+    let derivedFrom: DerivedFrom = 'BASE';
+
+    // 2) Volume discount (if any)
+    const volume = await this.loadVolumeDiscount(input.metric, input.quantity, ts);
+    if (volume) {
+      unitPriceCents = Number(volume.unit_price_cents);
+      derivedFrom = 'VOLUME';
+    }
+
+    // 3) Promotion (if any)
+    const promo = await this.loadPromotion(input.metric, ts);
+    if (promo) {
+      unitPriceCents = this.applyPromotion(
+        unitPriceCents,
+        promo.discount_type,
+        promo.discount_value,
+      );
+      derivedFrom = 'PROMOTION';
+    }
+
+    // 4) Tenant override (highest precedence)
+    const override = await this.loadOverride(input.tenantId, input.metric, ts);
+    if (override) {
+      unitPriceCents = this.applyOverride(
+        unitPriceCents,
+        override.override_type,
+        override.override_value,
+      );
+      derivedFrom = 'OVERRIDE';
+    }
+
+    const unitPriceUsd = unitPriceCents / 100;
+
+    return {
+      priceId: base.price_id,
+      unitPriceCents,
+      unitPriceUsd,
+      currency: base.currency ?? 'USD',
+      derivedFrom,
+    };
+  }
+
+  /**
+   * Convenience: compute estimated_cost_usd for a given quantity using the
+   * resolved unit price.
+   */
+  async estimateCostUsd(
+    input: ResolvePriceInput,
+  ): Promise<{
+    priceId: string;
+    unitPriceCents: number;
+    unitPriceUsd: number;
+    currency: string;
+    derivedFrom: DerivedFrom;
+    estimatedCostUsd: number;
+  }> {
+    const resolved = await this.resolvePrice(input);
+    const estimatedCostUsd = resolved.unitPriceUsd * input.quantity;
+    return { ...resolved, estimatedCostUsd };
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Internal DB helpers
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  private async loadBasePrice(metric: string, ts: Date) {
+    const sql = `
+      SELECT price_id, metric, unit, unit_price_cents, currency
+      FROM pricing.base_prices
+      WHERE metric = $1
+        AND effective_from <= $2
+        AND effective_to   > $2
+      ORDER BY effective_from DESC
+      LIMIT 1;
+    `;
+    const result = await this.pool.query(sql, [metric, ts]);
+    return result.rows[0] ?? null;
+  }
+
+  private async loadVolumeDiscount(metric: string, quantity: number, ts: Date) {
+    const sql = `
+      SELECT id, metric, min_quantity, max_quantity, unit_price_cents, currency
+      FROM pricing.volume_discounts
+      WHERE metric = $1
+        AND effective_from <= $2
+        AND effective_to   > $2
+        AND min_quantity   <= $3
+        AND max_quantity   >= $3
+      ORDER BY min_quantity DESC
+      LIMIT 1;
+    `;
+    const result = await this.pool.query(sql, [metric, ts, quantity]);
+    return result.rows[0] ?? null;
+  }
+
+  private async loadPromotion(metric: string, ts: Date) {
+    const sql = `
+      SELECT promotion_id, metric, discount_type, discount_value, currency
+      FROM pricing.promotions
+      WHERE metric = $1
+        AND effective_from <= $2
+        AND effective_to   > $2
+      ORDER BY effective_from DESC
+      LIMIT 1;
+    `;
+    const result = await this.pool.query(sql, [metric, ts]);
+    return result.rows[0] ?? null;
+  }
+
+  private async loadOverride(tenantId: string, metric: string, ts: Date) {
+    const sql = `
+      SELECT override_id, tenant_id, metric, override_type, override_value, currency
+      FROM pricing.overrides
+      WHERE tenant_id      = $1
+        AND metric         = $2
+        AND effective_from <= $3
+        AND effective_to   > $3
+      ORDER BY effective_from DESC
+      LIMIT 1;
+    `;
+    const result = await this.pool.query(sql, [tenantId, metric, ts]);
+    return result.rows[0] ?? null;
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Calculation helpers
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  private applyPromotion(
+    baseCents: number,
+    discountTypeRaw: string,
+    discountValueRaw: any,
+  ): number {
+    const type = (discountTypeRaw || '').toUpperCase();
+    const value = Number(discountValueRaw);
+
+    if (type === 'PERCENT') {
+      const discount = Math.round((baseCents * value) / 100); // 10 => 10% off
+      return Math.max(baseCents - discount, 0);
+    }
+
+    if (type === 'ABSOLUTE') {
+      const discount = Math.round(value); // 50 => 50 cents off
+      return Math.max(baseCents - discount, 0);
+    }
+
+    // Unknown type â€“ no change
+    return baseCents;
+  }
+
+  private applyOverride(
+    baseCents: number,
+    overrideTypeRaw: string,
+    overrideValueRaw: any,
+  ): number {
+    const type = (overrideTypeRaw || '').toUpperCase();
+    const value = Number(overrideValueRaw);
+
+    if (type === 'ABSOLUTE') {
+      // Force to this absolute price (cents)
+      return Math.max(Math.round(value), 0);
+    }
+
+    if (type === 'MARKUP_PERCENT') {
+      // 10 => add 10% markup
+      const delta = Math.round((baseCents * value) / 100);
+      return Math.max(baseCents + delta, 0);
+    }
+
+    if (type === 'MULTIPLIER') {
+      // 1.2 => 20% increase
+      return Math.max(Math.round(baseCents * value), 0);
+    }
+
+    // Unknown type â€“ fallback to base
+    return baseCents;
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\pricing
+
+===== pricingEngineInstance.ts =====
+// src/pricing/pricingEngineInstance.ts
+import { Pool } from 'pg';
+import { PricingEngine } from './PricingEngine';
+
+// Shared Pool using DATABASE_URL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// Singleton instance of PricingEngine
+export const pricingEngine = new PricingEngine(pool);
+
+// Optional: re-export types if you defined them in PricingEngine.ts
+// export type { ResolvePriceInput, ResolvePriceResult } from './PricingEngine';
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\repositories
+
+===== subscriptionRepository.ts =====
+import { Pool } from 'pg';
+import { Subscription } from '../models/subscription';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+export interface CreateSubscriptionInput {
+  tenantId: string;
+  serviceType: string;
+  driverId?: string;
+  quantity: number;
+  priceId: string;
+  unitPriceCents: number;
+  currency: string;
+  startsAt?: Date;
+}
+
+export async function createSubscription(
+  input: CreateSubscriptionInput,
+): Promise<Subscription> {
+  const {
+    tenantId,
+    serviceType,
+    driverId,
+    quantity,
+    priceId,
+    unitPriceCents,
+    currency,
+    startsAt,
+  } = input;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query<Subscription>(
+      `
+      INSERT INTO subscriptions (
+        tenant_id,
+        service_type,
+        driver_id,
+        status,
+        quantity,
+        price_id,
+        unit_price_cents,
+        currency,
+        starts_at
+      )
+      VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8)
+      RETURNING
+        subscription_id,
+        tenant_id,
+        service_type,
+        driver_id,
+        status,
+        quantity,
+        price_id,
+        unit_price_cents,
+        currency,
+        starts_at,
+        ends_at,
+        created_at
+      `,
+      [
+        tenantId,
+        serviceType,
+        driverId ?? null,
+        quantity,
+        priceId,
+        unitPriceCents,
+        currency,
+        startsAt ?? new Date(),
+      ],
+    );
+
+    return result.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
 
 ===== admin.js =====
@@ -29951,6 +31210,21 @@ router.post(
 
 
 module.exports = router;
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
+
+===== billingSubscriptions.router.ts =====
+// src/routes/billingSubscriptions.router.ts
+import { Router } from 'express';
+import { createSubscriptionHandler } from '../controllers/billingSubscriptions.controller';
+
+const router = Router();
+
+// POST /api/v1/billing/subscriptions
+router.post('/', createSubscriptionHandler);
+
+export { router as billingSubscriptionsRouter };
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\routes
@@ -30018,6 +31292,168 @@ const router = Router();
 router.post('/', ingestUsageEventHandler);
 
 export { router as usageEventsRouter };
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== BillingAggregator.ts =====
+// src/runtime/BillingAggregator.ts
+import { Kafka, EachMessagePayload } from 'kafkajs';
+import { Pool } from 'pg';
+import { PricingService } from './PricingService';
+
+export interface BillingAggregatorOptions {
+  kafkaBrokers: string[];
+  groupId: string;
+  topics: string[]; // e.g. ['usage.nlp', 'usage.agentic', 'usage.summarizer']
+}
+
+export class BillingAggregator {
+  private kafka: Kafka;
+  private pool: Pool;
+  private pricing: PricingService;
+  private options: BillingAggregatorOptions;
+
+  constructor(pool: Pool, pricing: PricingService, options: BillingAggregatorOptions) {
+    this.pool = pool;
+    this.pricing = pricing;
+    this.options = options;
+
+    this.kafka = new Kafka({
+      clientId: 'billing-aggregator',
+      brokers: options.kafkaBrokers,
+    });
+  }
+
+  async start() {
+    const consumer = this.kafka.consumer({ groupId: this.options.groupId });
+    await consumer.connect();
+
+    for (const topic of this.options.topics) {
+      await consumer.subscribe({ topic, fromBeginning: false });
+    }
+
+    await consumer.run({
+      eachMessage: async (payload: EachMessagePayload) => {
+        const { topic, message } = payload;
+
+        try {
+          if (!message.value) return;
+
+          const raw = message.value.toString('utf8');
+          console.log(
+  `[BillingAggregator] Received message on ${topic}, raw=`,
+  raw
+);
+
+          const event = JSON.parse(raw);
+
+          // Adjust these field names to match your usage-event schema:
+          const tenantId: string = event.tenant_id;
+          const serviceType: string = event.service_type;   // e.g. 'NLP'
+          const eventType: string = event.event_type;       // e.g. 'UDF_CALL'
+          const timestampStr: string = event.timestamp;
+
+          // FIXED: replaced \vert \vert with ||
+          const usageHash: string = event.event_hash || event.id || '';
+
+          const quantity: number = event.quantity ?? 1;
+
+          const timestamp = new Date(timestampStr);
+          const { windowStart, windowEnd } = computeMonthlyWindow(timestamp);
+
+          const { priceId, unitPrice, currency } = this.pricing.resolvePrice({
+            serviceType,
+            eventType,
+          });
+
+          const amount = unitPrice * quantity;
+
+          await this.insertBillingEvent({
+            tenantId,
+            serviceType,
+            usageEventId: event.id ?? null,
+            usageHash,
+            priceId,
+            priceAtPurchase: unitPrice,
+            quantity,
+            amount,
+            currency,
+            windowStart,
+            windowEnd,
+          });
+
+          console.log(
+            `[BillingAggregator] Recorded billing_event for tenant=${tenantId}, service=${serviceType}, price_id=${priceId}, amount=${amount}`
+          );
+        } catch (err) {
+          console.error('[BillingAggregator] Failed to process message', err);
+        }
+      },
+    });
+
+    console.log('[BillingAggregator] Consumer started');
+  }
+
+  private async insertBillingEvent(params: {
+    tenantId: string;
+    serviceType: string;
+    usageEventId: string | null;   // FIXED
+    usageHash: string;
+    priceId: string;
+    priceAtPurchase: number;
+    quantity: number;
+    amount: number;
+    currency: string;
+    windowStart: Date;
+    windowEnd: Date;
+  }) {
+    const sql = `
+      INSERT INTO billing_events (
+        tenant_id,
+        service_type,
+        usage_event_id,
+        usage_event_hash,
+        price_id,
+        price_at_purchase,
+        quantity,
+        amount,
+        currency_code,
+        window_start,
+        window_end
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    `;
+
+    const values = [
+      params.tenantId,
+      params.serviceType,
+      params.usageEventId,
+      params.usageHash,
+      params.priceId,
+      params.priceAtPurchase,
+      params.quantity,
+      params.amount,
+      params.currency,
+      params.windowStart.toISOString(),
+      params.windowEnd.toISOString(),
+    ];
+try {
+  await this.pool.query(sql, values);
+} catch (err) {
+  console.error('[BillingAggregator] DB insert failed', err);
+  throw err;
+}
+
+    await this.pool.query(sql, values);
+  }
+}
+
+function computeMonthlyWindow(ts: Date): { windowStart: Date; windowEnd: Date } {
+  const start = new Date(Date.UTC(ts.getUTCFullYear(), ts.getUTCMonth(), 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(ts.getUTCFullYear(), ts.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+  return { windowStart: start, windowEnd: end };
+}
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
@@ -30230,6 +31666,123 @@ export class CredentialStore {
 
 // Global singleton store for the process
 export const globalCredentialStore = new CredentialStore();
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== pgPool.ts =====
+// src/runtime/pgPool.ts
+import { Pool } from 'pg';
+
+export function createPgPool(): Pool {
+  const connectionString =
+    process.env.DATABASE_URL ?? 'postgres://dev:devpass@localhost:5432/agentary';
+
+  return new Pool({
+    connectionString,
+  });
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== PricingService.ts =====
+// src/runtime/PricingService.ts
+import fs from 'fs';
+import path from 'path';
+
+type PricingRecord = {
+  service_type: string;
+  unit: string;
+  unit_price: number;
+  currency: string;
+};
+
+type PricingConfig = Record<string, PricingRecord>;
+
+export class PricingService {
+  private pricing: PricingConfig;
+
+  constructor(configPath?: string) {
+    const file = configPath || path.join(__dirname, '..', 'config', 'pricing.json');
+    const raw = fs.readFileSync(file, 'utf8');
+    this.pricing = JSON.parse(raw) as PricingConfig;
+  }
+
+  /**
+   * Resolve the price for a usage event.
+   * You can decide where price_id comes from:
+   *  - directly from the usage event, OR
+   *  - derived from service_type + event_type.
+   */
+  resolvePrice(params: {
+    serviceType: string;
+    eventType: string;
+  }): { priceId: string; unitPrice: number; currency: string } {
+    // simplest: map by serviceType + eventType
+    let priceId: string;
+
+    if (params.serviceType === 'NLP' && params.eventType === 'UDF_CALL') {
+      priceId = 'NLP_UDF_CALL_V1';
+    } else if (params.serviceType === 'AGENTIC_AI' && params.eventType === 'EMAIL_REPLY') {
+      priceId = 'AGENTIC_EMAIL_V1';
+    } else if (params.serviceType === 'SUMMARIZER' && params.eventType === 'DOC_SUMMARY') {
+      priceId = 'SUMMARIZER_PAGE_V1';
+    } else {
+      throw new Error(`No pricing rule for serviceType=${params.serviceType}, eventType=${params.eventType}`);
+    }
+
+    const record = this.pricing[priceId];
+    if (!record) {
+      throw new Error(`Unknown priceId=${priceId}`);
+    }
+
+    return { priceId, unitPrice: record.unit_price, currency: record.currency };
+  }
+}
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
+
+===== publish-test-usage.js =====
+// src/runtime/publish-test-usage.js
+const { Kafka } = require('kafkajs');
+
+(async () => {
+  const kafka = new Kafka({
+    clientId: 'test-producer',
+    brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+  });
+
+  const producer = kafka.producer();
+  await producer.connect();
+
+  const event = {
+    id: 'evt_123',
+    tenant_id: 'tenant-123',
+    service_type: 'nlp',          // use lowercase to match your topic naming
+    event_type: 'UDF_CALL',
+    timestamp: new Date().toISOString(),
+    event_hash: 'hash_evt_123',
+    quantity: 1,
+  };
+
+  await producer.send({
+    topic: 'usage.nlp',           // BillingAggregator subscribes to this
+    messages: [
+      {
+        key: event.tenant_id,     // partition by tenant (recommended)
+        value: JSON.stringify(event),
+      },
+    ],
+  });
+
+  await producer.disconnect();
+  console.log('Sent test usage event');
+})().catch((err) => {
+  console.error('Producer error', err);
+  process.exit(1);
+});
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\runtime
@@ -30756,6 +32309,163 @@ module.exports = {
   getPlanLimitsForTenant,
   saveSelection,
 };
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\sla
+
+===== manualSlaTest.ts =====
+// src/sla/manualSlaTest.ts
+import { SlaCalculator, SlaIncident, SlaPolicy } from './slaCalculator';
+
+async function main() {
+  const calculator = new SlaCalculator();
+
+  // Example SLA incident: 25% breach on AGENTIC_AI, affecting \$100.00 of cost
+  const incidents: SlaIncident[] = [
+    {
+      id: 'incident-0001',
+      tenantId: '00000000-0000-0000-0000-000000000001',
+      serviceType: 'AGENTIC_AI',
+      severity: 'MAJOR',
+      breachPercent: 0.25,   // 25% breach
+      baseCostCents: 10000,  // \$100.00
+    },
+  ];
+
+  // Example policies: 0â€“10% -> 5% credit, 10â€“50% -> 20% credit
+  const policies: SlaPolicy[] = [
+    {
+      id: 'policy-001',
+      serviceType: 'AGENTIC_AI',
+      minBreachPercent: 0.0,
+      maxBreachPercent: 0.10,
+      creditPercent: 0.05,   // 5% credit
+      active: true,
+    },
+    {
+      id: 'policy-002',
+      serviceType: 'AGENTIC_AI',
+      minBreachPercent: 0.10,
+      maxBreachPercent: 0.50,
+      creditPercent: 0.20,   // 20% credit
+      active: true,
+    },
+  ];
+
+  const creditLines = calculator.calculateCredits(incidents, policies);
+
+  console.log('=== SLA Credit Calculation Demo ===');
+  console.log('Incidents:', JSON.stringify(incidents, null, 2));
+  console.log('Policies :', JSON.stringify(policies, null, 2));
+  console.log('Credits  :', JSON.stringify(creditLines, null, 2));
+
+  if (creditLines.length > 0) {
+    const c = creditLines[0];
+    console.log('\nHuman summary:');
+    console.log(
+      `Incident ${c.slaIncidentId}: credit amountCents=${c.amountCents} (should be negative)`,
+    );
+  }
+}
+
+main().catch((err) => {
+  console.error('manualSlaTest failed:', err);
+  process.exit(1);
+});
+
+
+### Folder: C:\Users\Admin\Documents\Github\Agentary\src\sla
+
+===== slaCalculator.ts =====
+// src/sla/slaCalculator.ts
+
+// 1) Types for SLA incidents and policies.
+// These are simple for now; later they can match your DB schema.
+export interface SlaIncident {
+  id: string;           // SLA incident id (UUID string)
+  tenantId: string;     // Tenant id
+  serviceType: string;  // e.g. "NLP", "AGENTIC_AI", "SUMMARIZER"
+  severity: 'MINOR' | 'MAJOR' | 'CRITICAL';
+  // 0.25 means 25% breach of SLA (for example, uptime or latency)
+  breachPercent: number;
+  // Cost, in cents, that was affected by this incident
+  baseCostCents: number;
+}
+
+export interface SlaPolicy {
+  id: string;
+  serviceType: string;   // must match incident.serviceType
+  // If breachPercent is between these, this policy applies
+  minBreachPercent: number;
+  maxBreachPercent: number;
+  // e.g. 0.1 means 10% credit on baseCostCents
+  creditPercent: number;
+  active: boolean;
+}
+
+// This is what we will attach to invoices as negative line items.
+// Later, invoice_lines can include these as credits.
+export interface SlaCreditLine {
+  description: string;
+  amountCents: number;   // NEGATIVE amount (credit)
+  slaIncidentId: string; // link back to incident for audit
+}
+
+// 2) The main calculator class.
+export class SlaCalculator {
+  /**
+   * Given SLA incidents and SLA policies, compute credit lines.
+   * Each incident will generate ONE credit line (for now).
+   */
+  public calculateCredits(
+    incidents: SlaIncident[],
+    policies: SlaPolicy[],
+  ): SlaCreditLine[] {
+    const creditLines: SlaCreditLine[] = [];
+
+    for (const incident of incidents) {
+      // Find a matching policy for this incident
+      const policy = policies.find((p) =>
+        p.active &&
+        p.serviceType === incident.serviceType &&
+        incident.breachPercent >= p.minBreachPercent &&
+        incident.breachPercent < p.maxBreachPercent
+      );
+
+      if (!policy) {
+        // No policy â†’ no credit for this incident
+        continue;
+      }
+
+      // Example credit math:
+      // credit = baseCostCents * creditPercent
+      // Make it NEGATIVE (credit = -amount).
+      const creditAmount = Math.floor(
+        incident.baseCostCents * policy.creditPercent
+      );
+      const creditAmountCents = -Math.abs(creditAmount); // ensure negative
+
+      // Build description for invoice line
+      const percentText = (incident.breachPercent * 100).toFixed(1);
+      const creditPercentText = (policy.creditPercent * 100).toFixed(1);
+
+      const description = [
+        `SLA credit for ${incident.serviceType} outage`,
+        `severity=${incident.severity}`,
+        `breach=${percentText}%`,
+        `credit=${creditPercentText}%`,
+      ].join(' | ');
+
+      creditLines.push({
+        description,
+        amountCents: creditAmountCents,
+        slaIncidentId: incident.id,
+      });
+    }
+
+    return creditLines;
+  }
+}
 
 
 ### Folder: C:\Users\Admin\Documents\Github\Agentary\src\utils

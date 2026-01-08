@@ -7,8 +7,9 @@
   "directories": {
     "doc": "docs"
   },
- "scripts": {
+"scripts": {
   "billing:dev": "ts-node src/billing-aggregator-main.ts",
+  "billing:invoice": "ts-node src/billing-invoice-main.ts",
   "api:dev": "ts-node src/server.ts",
   "api:start": "node dist/server.js",
   "test": "jest --detectOpenHandles",
@@ -17,6 +18,7 @@
   "build": "tsc --project tsconfig.json",
   "watch": "tsc --project tsconfig.json --watch"
 },
+
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kasetti-Technologies/Agentary.git"

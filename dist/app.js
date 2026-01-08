@@ -9,6 +9,7 @@ const tenantContext_middleware_1 = require("./middleware/tenantContext.middlewar
 const usageEvents_router_1 = require("./routes/usageEvents.router");
 const billingSubscriptions_router_1 = require("./routes/billingSubscriptions.router");
 const app = (0, express_1.default)();
+app.get('/health', (_req, res) => { res.status(200).json({ ok: true }); });
 // JSON body parser
 app.use(express_1.default.json());
 // Critical Setup Middleware (attaches tenantContext + dbClient)
